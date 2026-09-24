@@ -213,7 +213,12 @@ class PipelineOrchestrator:
             print(f"✓ DPO dataset verified at '{self.cfg.dpo_data_path}'")
 
     def run_pretrain(self):
-        self.print_stage_banner("1. Pre-training (Multi-GPU DDP)")
+        pretrain_title = (
+            f"1. Pre-training (Multi-GPU DDP - {self.num_gpus} GPUs)"
+            if self.num_gpus > 1
+            else "1. Pre-training (Single-GPU torchrun)"
+        )
+        self.print_stage_banner(pretrain_title)
         if self.cfg.resume_from in ("sft", "dpo"):
             print(f"⏩ Skipping Pre-training (resuming from stage '{self.cfg.resume_from}').")
             return
@@ -308,7 +313,7 @@ class PipelineOrchestrator:
         print("=" * 70)
         print(f"Model Size Target:      {self.cfg.size} (Tag: {self.size_tag})")
         print(f"Hardware Profile:       {self.hw_profile.device_name} ({self.hw_profile.arch_generation})")
-        print(f"Pre-training Compute:   {'Multi-GPU' if num_gpus > 1 else 'Single-GPU'} ({num_gpus} GPU{'s' if num_gpus > 1 else ''} via torchrun)")
+        print(f"Pre-training Compute:   {'Multi-GPU' if self.num_gpus > 1 else 'Single-GPU'} ({self.num_gpus} GPU{'s' if self.num_gpus > 1 else ''} via torchrun)")
         print(f"Alignment Compute:      Single-GPU (SFT & DPO)")
         print("=" * 70)
 
