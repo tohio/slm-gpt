@@ -12,6 +12,15 @@ from typing import List, Optional, Tuple
 
 import torch
 
+BASE_PACKAGES: List[str] = [
+    "regex",
+    "datasets>=2.14.0",
+    "python-dotenv>=1.0.0",
+    "packaging>=23.0",
+    "ninja>=1.11.0",
+    "wandb",
+]
+
 
 class HardwareProfile:
     def __init__(
@@ -70,8 +79,8 @@ class HardwareProfiler:
                     compute_capability=cap,
                     precision=torch.bfloat16,
                     precision_str="bfloat16",
-                    wheel_index_url="https://download.pytorch.org/whl/cu130",  #
-                    recommended_packages=[
+                    wheel_index_url="https://download.pytorch.org/whl/cu130",
+                    recommended_packages=BASE_PACKAGES + [
                         "torch>=2.5.0",
                         "numpy>=1.26.0",
                         "tiktoken>=0.7.0",
@@ -94,7 +103,7 @@ class HardwareProfiler:
                     precision=torch.bfloat16,
                     precision_str="bfloat16",
                     wheel_index_url="https://download.pytorch.org/whl/cu126",
-                    recommended_packages=[
+                    recommended_packages=BASE_PACKAGES + [
                         "torch>=2.4.0",
                         "numpy>=1.26.0",
                         "tiktoken>=0.7.0",
@@ -116,7 +125,7 @@ class HardwareProfiler:
                     precision=torch.bfloat16,
                     precision_str="bfloat16",
                     wheel_index_url="https://download.pytorch.org/whl/cu124",
-                    recommended_packages=[
+                    recommended_packages=BASE_PACKAGES + [
                         "torch>=2.4.0",
                         "numpy>=1.26.0",
                         "tiktoken>=0.7.0",
@@ -138,7 +147,7 @@ class HardwareProfiler:
                     precision=torch.float16,
                     precision_str="float16",
                     wheel_index_url="https://download.pytorch.org/whl/cu121",
-                    recommended_packages=[
+                    recommended_packages=BASE_PACKAGES + [
                         "torch>=2.4.0",
                         "numpy>=1.26.0",
                         "tiktoken>=0.7.0",
@@ -159,7 +168,7 @@ class HardwareProfiler:
                 precision=torch.float32,
                 precision_str="float32",
                 wheel_index_url=None,
-                recommended_packages=[
+                recommended_packages=BASE_PACKAGES + [
                     "torch>=2.4.0",
                     "numpy>=1.26.0",
                     "tiktoken>=0.7.0",
@@ -179,7 +188,7 @@ class HardwareProfiler:
             precision=torch.float32,
             precision_str="float32",
             wheel_index_url="https://download.pytorch.org/whl/cpu",
-            recommended_packages=[
+            recommended_packages=BASE_PACKAGES + [
                 "torch>=2.4.0",
                 "numpy>=1.26.0",
                 "tiktoken>=0.7.0",
