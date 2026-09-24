@@ -4,9 +4,12 @@ Integrates HardwareProfiler, Stage 0 Data Ingestion & Packing, and
 sequential Pre-training -> SFT -> DPO execution with Health Gates.
 """
 
+import os
+# Configure PyTorch virtual memory segments for orchestrator and subprocesses
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from dataclasses import dataclass
 import glob
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -30,7 +33,7 @@ class PipelineConfig:
     tokenizer_type: str = "tiktoken"
     tokenizer_path: Optional[str] = None
     num_gpus: Optional[int] = None
-    micro_batch_size: Optional[int] = None  # CLI override support (e.g. micro_batch_size=32)
+    micro_batch_size: Optional[int] = None  # Explicit CLI override support
     resume_from: Optional[str] = None  # None, "sft", or "dpo"
 
     # Stage Data Paths
@@ -247,6 +250,7 @@ class PipelineOrchestrator:
         if not os.path.exists(self.pretrain_ckpt):
             raise FileNotFoundError(f"Base checkpoint required for SFT not found: '{self.pretrain_ckpt}'")
 
+        sft_batch = min(16, self.auto_micro_batch)
         cmd = [
             sys.executable,
             "-m", "sft.train",
@@ -255,7 +259,7 @@ class PipelineOrchestrator:
             f"data_path={self.cfg.sft_data_path}",
             f"epochs={self.cfg.sft_epochs}",
             f"tokenizer_type={self.cfg.tokenizer_type}",
-            f"per_device_batch_size={self.auto_micro_batch}",
+            f"per_device_batch_size={sft_batch}",
         ]
         if self.cfg.tokenizer_path:
             cmd.append(f"tokenizer_path={self.cfg.tokenizer_path}")
@@ -274,6 +278,7 @@ class PipelineOrchestrator:
         if not os.path.exists(self.sft_ckpt):
             raise FileNotFoundError(f"Reference SFT checkpoint required for DPO not found: '{self.sft_ckpt}'")
 
+        dpo_batch = max(1, min(8, self.auto_micro_batch // 2))
         cmd = [
             sys.executable,
             "-m", "dpo.train",
@@ -282,7 +287,7 @@ class PipelineOrchestrator:
             f"data_path={self.cfg.dpo_data_path}",
             f"epochs={self.cfg.dpo_epochs}",
             f"tokenizer_type={self.cfg.tokenizer_type}",
-            f"per_device_batch_size={max(1, self.auto_micro_batch // 2)}",
+            f"per_device_batch_size={dpo_batch}",
         ]
         if self.cfg.tokenizer_path:
             cmd.append(f"tokenizer_path={self.cfg.tokenizer_path}")

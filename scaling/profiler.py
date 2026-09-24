@@ -244,20 +244,22 @@ def tune_micro_batch_size(
     """
     # 1. Static memory: Model (bf16: 2B), AdamW states (fp32: 8B), Gradients (4B) + CUDA/DDP context (2.5 GB)
     static_gb = (target_params * 14) / (1024 ** 3) + 2.5
-    usable_vram = max(1.0, (total_memory_gb * 0.80) - static_gb)
+    usable_vram = max(1.0, (total_memory_gb * 0.75) - static_gb)
 
     # 2. Dynamic memory per sample (B=1):
     # - Logits projection (bf16): T * V * 2 bytes
     # - PyTorch cross_entropy logit reduction (fp32): T * V * 4 bytes
-    # - Transformer layer activations: ~T * hidden_dim * 80
-    vocab_workspace_bytes = max_seq_len * vocab_size * 6
-    activation_bytes = max_seq_len * 768 * 80
+    # - PyTorch cross_entropy backward gradient (fp32): T * V * 4 bytes
+    # - Transformer layer activations across all layers: ~T * hidden_dim * 90 bytes
+    vocab_workspace_bytes = max_seq_len * vocab_size * 10
+    activation_bytes = max_seq_len * 768 * 90
     per_sample_gb = (vocab_workspace_bytes + activation_bytes) / (1024 ** 3)
 
     estimated_batch = int(usable_vram / max(per_sample_gb, 0.1))
 
-    # Safe powers of two ceiling (32 for T=2048 prevents cross-entropy workspace OOM)
-    powers = [32, 16, 8, 4, 2, 1]
+    # Safe ceiling: For sequence lengths >= 2048, micro-batch size 16 is optimal
+    # to maintain safe headroom and prevent fragmentation OOM during backward.
+    powers = [16, 8, 4, 2, 1] if max_seq_len >= 2048 else [32, 16, 8, 4, 2, 1]
     for p in powers:
         if estimated_batch >= p:
             return p
