@@ -115,7 +115,8 @@ def test_estimate_loss_evaluation(temp_bin_dataset):
         tmpdir, "val", B=2, T=seq_len, process_rank=0, num_processes=1, device="cpu"
     )
 
-    val_loss = estimate_loss(model, val_loader, dtype=torch.float32, eval_iters=2)
+    # bfloat16 satisfies CPU autocast without triggering float32 unsupported warnings
+    val_loss = estimate_loss(model, val_loader, dtype=torch.bfloat16, eval_iters=2)
     assert isinstance(val_loss, float)
     assert not math.isnan(val_loss) and val_loss > 0.0
 
