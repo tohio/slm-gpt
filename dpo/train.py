@@ -4,15 +4,23 @@ Features concatenated forward passes for high throughput, PyTorch 2.6+ safe
 deserialization, and dynamic config reconstruction from checkpoints.
 """
 
+import os
+# Configure PyTorch virtual memory segments before any CUDA initialization
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from dataclasses import asdict, dataclass, fields
 import math
-import os
+from pathlib import Path
 import sys
 from typing import Optional, Tuple
 
 import torch
 import torch.serialization
 from torch.utils.data import DataLoader
+
+# Ensure repository root is on sys.path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 from dpo.collator import DPODataCollator
 from dpo.dataset import PreferenceDataset
@@ -31,9 +39,9 @@ except AttributeError:
 @dataclass
 class DPOArgs:
     # Checkpoints & Data
-    sft_model_path: str = "checkpoints/sft_125m/sft_final.pt"
+    sft_model_path: str = "checkpoints/sft_125M/sft_final.pt"
     data_path: str = "data/dpo/preference_pairs.jsonl"
-    output_dir: str = "checkpoints/dpo_125m"
+    output_dir: str = "checkpoints/dpo_125M"
 
     # Tokenizer
     tokenizer_type: str = "tiktoken"
@@ -41,7 +49,7 @@ class DPOArgs:
 
     # Architecture fallback parameters
     vocab_size: int = 50304
-    max_seq_len: int = 2048
+    max_seq_len: int = 1024
     d_model: int = 768
     n_layers: int = 14
     n_heads: int = 12
@@ -53,8 +61,8 @@ class DPOArgs:
     beta: float = 0.1
     learning_rate: float = 5e-7
     min_learning_rate: float = 5e-8
-    per_device_batch_size: int = 2
-    gradient_accumulation_steps: int = 16  # Effective batch size = 32
+    per_device_batch_size: int = 8
+    gradient_accumulation_steps: int = 4  # Effective batch size = 32
     max_grad_norm: float = 1.0
     epochs: int = 1
     warmup_ratio: float = 0.1
@@ -78,7 +86,7 @@ def resolve_model_config(checkpoint_path: str, args: DPOArgs, device: str) -> Tu
 
     resolved_path = checkpoint_path
     if not os.path.exists(resolved_path):
-        fallback = os.path.join(os.path.dirname(checkpoint_path), "sft_epoch_2.pt")
+        fallback = os.path.join(os.path.dirname(checkpoint_path), "sft_epoch_1.pt")
         if os.path.exists(fallback):
             print(f"[Notice] '{resolved_path}' not found. Falling back to '{fallback}'.")
             resolved_path = fallback
@@ -123,28 +131,38 @@ def resolve_model_config(checkpoint_path: str, args: DPOArgs, device: str) -> Tu
     return cfg, {}
 
 
-def parse_args_from_cli(args_cls):
-    """Loads default dataclass arguments and applies key=value CLI overrides."""
+def parse_args_from_cli(args_target) -> DPOArgs:
+    """Loads default dataclass arguments and applies key=value CLI overrides safely."""
+    cls = args_target if isinstance(args_target, type) else args_target.__class__
+    instance = args_target if not isinstance(args_target, type) else args_target()
+
     kwargs = {}
     for arg in sys.argv[1:]:
         if "=" in arg:
             k, v = arg.split("=", 1)
             k = k.lstrip("-")
-            if hasattr(args_cls, k):
-                orig_val = getattr(args_cls, k)
+            if hasattr(instance, k):
+                orig_val = getattr(instance, k)
                 if isinstance(orig_val, bool):
                     kwargs[k] = v.lower() in ("true", "1", "yes")
                 elif isinstance(orig_val, int):
-                    kwargs[k] = int(v)
+                    kwargs[k] = int(v) if v.lower() != "none" else None
                 elif isinstance(orig_val, float):
-                    kwargs[k] = float(v)
+                    kwargs[k] = float(v) if v.lower() != "none" else None
                 else:
-                    kwargs[k] = v
-    return args_cls(**kwargs)
+                    kwargs[k] = v if v.lower() != "none" else None
+
+    data = {f.name: getattr(instance, f.name) for f in fields(cls)}
+    data.update(kwargs)
+    return cls(**data)
 
 
 def train_dpo(args: DPOArgs):
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.empty_cache()
+
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"--- Launching DPO Training Pipeline on {args.device.upper()} ---")
 
@@ -161,6 +179,9 @@ def train_dpo(args: DPOArgs):
     if state_dict:
         policy_model.load_state_dict(state_dict, strict=False)
         ref_model.load_state_dict(state_dict, strict=False)
+
+    policy_model.lm_head.weight = policy_model.wte.weight
+    ref_model.lm_head.weight = ref_model.wte.weight
 
     ref_model.eval()
     for param in ref_model.parameters():
@@ -184,13 +205,14 @@ def train_dpo(args: DPOArgs):
     else:
         dataset = PreferenceDataset(args.data_path, tokenizer=tokenizer, max_seq_len=config.max_seq_len)
 
+    drop_last = len(dataset) >= args.per_device_batch_size
     loader = DataLoader(
         dataset,
         batch_size=args.per_device_batch_size,
         shuffle=True,
         collate_fn=collator,
         pin_memory=(args.device == "cuda"),
-        drop_last=True,
+        drop_last=drop_last,
     )
 
     # 3. Optimizer & Objective
@@ -203,7 +225,8 @@ def train_dpo(args: DPOArgs):
     )
     dpo_criterion = DPOLoss(beta=args.beta)
 
-    total_steps = (len(loader) // args.gradient_accumulation_steps) * args.epochs
+    steps_per_epoch = max(1, math.ceil(len(loader) / max(1, args.gradient_accumulation_steps)))
+    total_steps = max(1, steps_per_epoch * args.epochs)
     warmup_steps = int(total_steps * args.warmup_ratio)
     global_step = 0
 
@@ -275,4 +298,4 @@ def train_dpo(args: DPOArgs):
 
 
 if __name__ == "__main__":
-    train_dpo(parse_args_from_cli(DPOArgs()))
+    train_dpo(parse_args_from_cli(DPOArgs))

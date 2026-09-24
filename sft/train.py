@@ -11,9 +11,13 @@ Features:
 - Safe serialization using asdict(config) to guarantee PyTorch 2.6+ weights_only compatibility.
 """
 
-from dataclasses import asdict, dataclass
-import math
 import os
+# Configure PyTorch virtual memory segments before any CUDA initialization
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+from dataclasses import asdict, dataclass, fields
+import math
+from pathlib import Path
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,6 +27,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.serialization
 from torch.utils.data import DataLoader, random_split
+
+# Ensure repository root is on sys.path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 # slm-gpt internal modules
 from transformer.config import ModelConfig
@@ -43,16 +51,16 @@ class SFTArgs:
     # Model & Data Paths
     data_path: str = "data/sft/train.jsonl"
     val_path: Optional[str] = "data/sft/val.jsonl"
-    pretrained_ckpt: str = "checkpoints/pretrained_125m/best_model.pt"
-    output_dir: str = "checkpoints/sft_125m"
+    pretrained_ckpt: str = "checkpoints/pretrain_125M/best_model.pt"
+    output_dir: str = "checkpoints/sft_125M"
 
     # Tokenizer
     tokenizer_type: str = "tiktoken"
     tokenizer_path: Optional[str] = None
 
     # Optimization Hyperparameters
-    per_device_batch_size: int = 4
-    gradient_accumulation_steps: int = 8  # Effective batch size = 32 dialogues
+    per_device_batch_size: int = 16
+    gradient_accumulation_steps: int = 2  # Effective batch size = 32 dialogues
     learning_rate: float = 2.5e-5
     min_lr_ratio: float = 0.1
     weight_decay: float = 0.01
@@ -211,32 +219,39 @@ def evaluate(
     return mean_loss, perplexity
 
 
-def parse_args_from_cli(args_cls):
-    """Loads default dataclass arguments and applies key=value CLI overrides."""
+def parse_args_from_cli(args_target) -> SFTArgs:
+    """Loads default dataclass arguments and applies key=value CLI overrides safely."""
+    cls = args_target if isinstance(args_target, type) else args_target.__class__
+    instance = args_target if not isinstance(args_target, type) else args_target()
+
     kwargs = {}
     for arg in sys.argv[1:]:
         if "=" in arg:
             k, v = arg.split("=", 1)
             k = k.lstrip("-")
-            if hasattr(args_cls, k):
-                orig_val = getattr(args_cls, k)
+            if hasattr(instance, k):
+                orig_val = getattr(instance, k)
                 if isinstance(orig_val, bool):
                     kwargs[k] = v.lower() in ("true", "1", "yes")
                 elif isinstance(orig_val, int):
-                    kwargs[k] = int(v)
+                    kwargs[k] = int(v) if v.lower() != "none" else None
                 elif isinstance(orig_val, float):
-                    kwargs[k] = float(v)
+                    kwargs[k] = float(v) if v.lower() != "none" else None
                 else:
-                    kwargs[k] = v
-    return args_cls(**kwargs)
+                    kwargs[k] = v if v.lower() != "none" else None
+
+    data = {f.name: getattr(instance, f.name) for f in fields(cls)}
+    data.update(kwargs)
+    return cls(**data)
 
 
 def train(args: SFTArgs):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
+        torch.cuda.empty_cache()
 
+    os.makedirs(args.output_dir, exist_ok=True)
     print(f"--- Launching SFT Pipeline on {args.device.upper()} ---")
 
     # 1. Precision configuration
@@ -252,19 +267,23 @@ def train(args: SFTArgs):
     if args.val_path and os.path.exists(args.val_path):
         val_dataset = SFTDataset(args.val_path, tokenizer=tokenizer, max_seq_len=args.max_seq_len)
     else:
-        train_size = int(0.95 * len(train_dataset))
+        train_size = max(1, int(0.95 * len(train_dataset)))
         val_size = len(train_dataset) - train_size
-        train_dataset, val_dataset = random_split(
-            train_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(args.seed)
-        )
+        if val_size > 0:
+            train_dataset, val_dataset = random_split(
+                train_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(args.seed)
+            )
+        else:
+            val_dataset = train_dataset
 
+    drop_last = len(train_dataset) >= args.per_device_batch_size
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.per_device_batch_size,
         shuffle=True,
         collate_fn=collator,
         pin_memory=(args.device == "cuda"),
-        drop_last=True,
+        drop_last=drop_last,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -279,11 +298,19 @@ def train(args: SFTArgs):
     print(f"[Weights] Loading pre-trained base from '{args.pretrained_ckpt}'")
     checkpoint = torch.load(args.pretrained_ckpt, map_location=args.device, weights_only=False)
 
+    valid_fields = {f.name for f in fields(ModelConfig)}
     if "config" in checkpoint:
         cfg_raw = checkpoint["config"]
-        cfg_dict = cfg_raw.__dict__ if hasattr(cfg_raw, "__dict__") else dict(cfg_raw)
-        cfg_dict["max_seq_len"] = args.max_seq_len
-        config = ModelConfig(**cfg_dict)
+        if isinstance(cfg_raw, ModelConfig):
+            cfg_dict = {f.name: getattr(cfg_raw, f.name) for f in fields(ModelConfig)}
+        elif hasattr(cfg_raw, "__dict__"):
+            cfg_dict = dict(cfg_raw.__dict__)
+        else:
+            cfg_dict = dict(cfg_raw)
+
+        filtered = {k: v for k, v in cfg_dict.items() if k in valid_fields}
+        filtered["max_seq_len"] = args.max_seq_len
+        config = ModelConfig(**filtered)
     else:
         config = ModelConfig(
             vocab_size=50304,
@@ -303,7 +330,10 @@ def train(args: SFTArgs):
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state_dict, strict=False)
 
+    # Guarantee weight tying
+    model.lm_head.weight = model.wte.weight
     assert model.wte.weight.data_ptr() == model.lm_head.weight.data_ptr(), "Weight tying broken!"
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[Architecture] Initialized {config.n_layers} layers, {total_params:,} parameters ({total_params/1e6:.2f}M).")
 
@@ -321,7 +351,7 @@ def train(args: SFTArgs):
         fused=(args.device == "cuda"),
     )
 
-    steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / max(1, args.gradient_accumulation_steps)))
     total_training_steps = max(1, steps_per_epoch * args.epochs)
     warmup_steps = int(total_training_steps * args.warmup_ratio)
 
@@ -391,8 +421,9 @@ def train(args: SFTArgs):
                 running_loss += accum_loss
                 accum_loss = 0.0
 
-                if global_step % args.log_interval_steps == 0:
-                    avg_step_loss = running_loss / args.log_interval_steps
+                if global_step % args.log_interval_steps == 0 or global_step == total_training_steps:
+                    denom = args.log_interval_steps if global_step % args.log_interval_steps == 0 else max(1, global_step % args.log_interval_steps)
+                    avg_step_loss = running_loss / denom
                     curr_lr = scheduler.get_last_lr()[0]
                     print(
                         f"Epoch {epoch + 1:02d}/{args.epochs:02d} | "
@@ -440,4 +471,4 @@ def train(args: SFTArgs):
 
 
 if __name__ == "__main__":
-    train(parse_args_from_cli(SFTArgs()))
+    train(parse_args_from_cli(SFTArgs))
