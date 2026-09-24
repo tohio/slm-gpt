@@ -253,7 +253,8 @@ def train_dpo(args: DPOArgs):
 
     # 2. Dataset & Collator
     tokenizer = get_tokenizer(args.tokenizer_type, args.tokenizer_path)
-    collator = DPODataCollator(pad_token_id=tokenizer.pad_token_id, pad_to_multiple_of=16)
+    pad_id = getattr(tokenizer, "pad_id", getattr(tokenizer, "pad_token_id", 50259))
+    collator = DPODataCollator(pad_token_id=pad_id, pad_to_multiple_of=16)
 
     dataset = None
     if os.path.exists(args.data_path):

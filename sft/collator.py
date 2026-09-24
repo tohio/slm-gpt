@@ -1,4 +1,8 @@
-"""sft/collator.py: Hardware-aligned dynamic batch collator for SFT."""
+"""
+sft/collator.py: Hardware-aligned dynamic batch collator for SFT.
+Pads sequences using dedicated <|pad|> (50259) and aligns sequence
+lengths to multiples of 16 for NVIDIA Tensor Core efficiency.
+"""
 
 from typing import Dict, List
 import torch
@@ -6,14 +10,14 @@ from sft.dataset import IGNORE_INDEX
 
 
 class SFTDataCollator:
-    """Collates variable-length dialogue tokens into dynamically padded,
-
+    """
+    Collates variable-length dialogue tokens into dynamically padded,
     hardware-aligned batches.
     """
 
     def __init__(
         self,
-        pad_token_id: int = 50256,  # <|endoftext|>
+        pad_token_id: int = 50259,  # Dedicated <|pad|> token
         pad_to_multiple_of: int = 16,  # Tensor Core alignment
     ):
         self.pad_token_id = pad_token_id

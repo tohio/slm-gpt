@@ -1,6 +1,7 @@
 """
 dpo/collator.py: Dynamic dual-sequence batch collator for DPO.
-Pads chosen and rejected token sequences to a uniform length aligned to multiples of 16.
+Pads chosen and rejected token sequences to a uniform length aligned to multiples of 16
+using the dedicated <|pad|> token (50259).
 """
 
 from typing import Dict, List
@@ -13,7 +14,11 @@ except ImportError:
 
 
 class DPODataCollator:
-    def __init__(self, pad_token_id: int = 50256, pad_to_multiple_of: int = 16):
+    def __init__(
+        self,
+        pad_token_id: int = 50259,  # Dedicated <|pad|> token
+        pad_to_multiple_of: int = 16,
+    ):
         self.pad_token_id = pad_token_id
         self.pad_to_multiple_of = pad_to_multiple_of
 
