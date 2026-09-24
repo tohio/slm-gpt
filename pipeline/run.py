@@ -40,16 +40,19 @@ class PipelineConfig:
     pretrain_data_dir: str = "data/pretrain"
     sft_data_path: str = "data/sft/train.jsonl"
     dpo_data_path: str = "data/dpo/preference_pairs.jsonl"
+    dpo_dataset: Optional[str] = None  # Remote HF dataset override (e.g. 'HuggingFaceH4/dpo-mix-7k')
 
     # Stage 0 Data Budgets (Used if data is missing on cold-start)
     bootstrap_pretrain_tokens: int = 10_000_000
     bootstrap_sft_samples: int = 5_000
-    bootstrap_dpo_samples: int = 2_000
+    bootstrap_dpo_samples: int = 7_000
 
     # Training Budgets
     pretrain_max_steps: Optional[int] = None
     sft_epochs: int = 3
     dpo_epochs: int = 1
+    dpo_max_steps: Optional[int] = None
+    dpo_learning_rate: float = 5e-7
 
 
 def parse_cli_args(args_cls: type[PipelineConfig]) -> PipelineConfig:
@@ -57,8 +60,9 @@ def parse_cli_args(args_cls: type[PipelineConfig]) -> PipelineConfig:
     int_fields = {
         "num_gpus", "micro_batch_size", "bootstrap_pretrain_tokens",
         "bootstrap_sft_samples", "bootstrap_dpo_samples",
-        "pretrain_max_steps", "sft_epochs", "dpo_epochs"
+        "pretrain_max_steps", "sft_epochs", "dpo_epochs", "dpo_max_steps"
     }
+    float_fields = {"dpo_learning_rate"}
 
     for arg in sys.argv[1:]:
         if "=" in arg:
@@ -70,7 +74,7 @@ def parse_cli_args(args_cls: type[PipelineConfig]) -> PipelineConfig:
                     kwargs[k] = v.lower() in ("true", "1", "yes")
                 elif k in int_fields:
                     kwargs[k] = int(v) if v.lower() != "none" else None
-                elif isinstance(orig_val, float):
+                elif k in float_fields:
                     kwargs[k] = float(v) if v.lower() != "none" else None
                 else:
                     kwargs[k] = v if v.lower() != "none" else None
@@ -198,19 +202,49 @@ class PipelineOrchestrator:
             print(f"✓ SFT dataset verified at '{self.cfg.sft_data_path}'")
 
         # 0C. DPO Preference Check
-        if not os.path.exists(self.cfg.dpo_data_path):
-            print(f"⚠️ DPO dataset missing at '{self.cfg.dpo_data_path}'. Extracting preference pairs...")
-            cmd = [
-                sys.executable,
-                "-m", "data.prepare_dpo",
-                f"--output_path={self.cfg.dpo_data_path}",
-                f"--max_samples={self.cfg.bootstrap_dpo_samples}",
-            ]
-            ret = subprocess.run(cmd)
-            if ret.returncode != 0:
-                raise RuntimeError("Stage 0: DPO dataset preparation failed.")
+        dpo_target = self.cfg.dpo_dataset or self.cfg.dpo_data_path
+        is_remote = ("/" in dpo_target and not os.path.exists(dpo_target))
+
+        if not is_remote:
+            dpo_missing = not os.path.exists(self.cfg.dpo_data_path)
+            dpo_stub = False
+            if not dpo_missing:
+                # Stub check: less than 50KB means mock or tiny bootstrap stub
+                size_bytes = os.path.getsize(self.cfg.dpo_data_path)
+                if size_bytes < 50_000:
+                    dpo_stub = True
+
+            if dpo_missing or dpo_stub:
+                reason = "missing" if dpo_missing else "minimal smoke stub (<50KB)"
+                print(f"⚠️ DPO dataset at '{self.cfg.dpo_data_path}' is {reason}. Ingesting preference pairs...")
+                out_dir = os.path.dirname(self.cfg.dpo_data_path) or "data/dpo"
+                os.makedirs(out_dir, exist_ok=True)
+
+                prep_script = Path(REPO_ROOT) / "data" / "prepare_dpo.py"
+                if prep_script.exists():
+                    cmd = [
+                        sys.executable,
+                        "-m", "data.prepare_dpo",
+                        f"--output_path={self.cfg.dpo_data_path}",
+                        f"--max_samples={self.cfg.bootstrap_dpo_samples}",
+                    ]
+                    ret = subprocess.run(cmd)
+                    if ret.returncode != 0:
+                        raise RuntimeError("Stage 0: DPO dataset preparation failed.")
+                else:
+                    # Direct ingestion of dpo-mix-7k to local jsonl
+                    try:
+                        from datasets import load_dataset
+                        print("   Downloading 'HuggingFaceH4/dpo-mix-7k' from Hugging Face Hub...")
+                        ds = load_dataset("HuggingFaceH4/dpo-mix-7k", split="train")
+                        ds.to_json(self.cfg.dpo_data_path, orient="records", lines=True)
+                        print(f"✓ Ingested {len(ds):,} pairs into '{self.cfg.dpo_data_path}'")
+                    except Exception as e:
+                        print(f"[Warning] Could not pre-download DPO dataset: {e}")
+            else:
+                print(f"✓ DPO dataset verified at '{self.cfg.dpo_data_path}'")
         else:
-            print(f"✓ DPO dataset verified at '{self.cfg.dpo_data_path}'")
+            print(f"✓ DPO remote dataset configured: '{dpo_target}' (will stream directly in Stage 3)")
 
     def run_pretrain(self):
         pretrain_title = (
@@ -284,18 +318,23 @@ class PipelineOrchestrator:
             raise FileNotFoundError(f"Reference SFT checkpoint required for DPO not found: '{self.sft_ckpt}'")
 
         dpo_batch = max(1, min(8, self.auto_micro_batch // 2))
+        target_dataset = self.cfg.dpo_dataset if self.cfg.dpo_dataset else self.cfg.dpo_data_path
+
         cmd = [
             sys.executable,
             "-m", "dpo.train",
             f"sft_model_path={self.sft_ckpt}",
             f"output_dir=checkpoints/dpo_{self.size_tag}",
-            f"data_path={self.cfg.dpo_data_path}",
+            f"data_path={target_dataset}",
             f"epochs={self.cfg.dpo_epochs}",
+            f"learning_rate={self.cfg.dpo_learning_rate}",
             f"tokenizer_type={self.cfg.tokenizer_type}",
             f"per_device_batch_size={dpo_batch}",
         ]
         if self.cfg.tokenizer_path:
             cmd.append(f"tokenizer_path={self.cfg.tokenizer_path}")
+        if self.cfg.dpo_max_steps:
+            cmd.append(f"max_steps={self.cfg.dpo_max_steps}")
 
         print(f"Command: {' '.join(cmd)}")
         ret = subprocess.run(cmd)

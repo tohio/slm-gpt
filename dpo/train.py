@@ -1,7 +1,7 @@
 """
 dpo/train.py: Direct Preference Optimization execution engine for slm-gpt.
 Features concatenated forward passes for high throughput, PyTorch 2.6+ safe
-deserialization, and dynamic config reconstruction from checkpoints.
+deserialization, support for both local files and Hugging Face datasets, and dynamic config reconstruction.
 """
 
 import os
@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, fields
 import math
 from pathlib import Path
 import sys
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.serialization
@@ -37,6 +37,7 @@ except AttributeError:
 
 import warnings
 warnings.filterwarnings("ignore", message=".*Argument aux_data.*cannot be converted to a JitArgument.*")
+
 
 @dataclass
 class DPOArgs:
@@ -67,6 +68,7 @@ class DPOArgs:
     gradient_accumulation_steps: int = 4  # Effective batch size = 32
     max_grad_norm: float = 1.0
     epochs: int = 1
+    max_steps: Optional[int] = None
     warmup_ratio: float = 0.1
     log_interval_steps: int = 5
     seed: int = 42
@@ -81,6 +83,60 @@ def get_cosine_lr(step: int, total_steps: int, warmup_steps: int, max_lr: float,
     decay_ratio = (step - warmup_steps) / max(1, total_steps - warmup_steps)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
+
+
+def _extract_turn_text(val: Any) -> str:
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, list):
+        turns = []
+        for turn in val:
+            if isinstance(turn, dict):
+                content = turn.get("content", "")
+                turns.append(str(content).strip())
+            else:
+                turns.append(str(turn).strip())
+        return "\n".join(turns).strip()
+    return str(val).strip()
+
+
+def normalize_preference_example(example: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Normalizes Hugging Face / JSONL records to standard prompt/chosen/rejected dicts."""
+    prompt = example.get("prompt", "")
+    chosen = example.get("chosen", "")
+    rejected = example.get("rejected", "")
+
+    # Multi-turn conversation format where chosen contains full message list
+    if isinstance(chosen, list) and len(chosen) > 0 and isinstance(chosen[0], dict):
+        if not prompt and len(chosen) >= 2:
+            prompt_turns = [t.get("content", "") for t in chosen[:-1]]
+            prompt = "\n".join(prompt_turns)
+            chosen = chosen[-1].get("content", "")
+        elif len(chosen) == 1:
+            chosen = chosen[0].get("content", "")
+        else:
+            chosen = _extract_turn_text(chosen)
+
+    if isinstance(rejected, list) and len(rejected) > 0 and isinstance(rejected[0], dict):
+        if len(rejected) >= 2 and not prompt:
+            rejected = rejected[-1].get("content", "")
+        elif len(rejected) == 1:
+            rejected = rejected[0].get("content", "")
+        else:
+            rejected = _extract_turn_text(rejected)
+
+    prompt_str = _extract_turn_text(prompt)
+    chosen_str = _extract_turn_text(chosen)
+    rejected_str = _extract_turn_text(rejected)
+
+    if not chosen_str or not rejected_str:
+        return None
+
+    return {
+        "prompt": prompt_str,
+        "chosen": chosen_str,
+        "rejected": rejected_str,
+    }
 
 
 def resolve_model_config(checkpoint_path: str, args: DPOArgs, device: str) -> Tuple[ModelConfig, dict]:
@@ -138,19 +194,25 @@ def parse_args_from_cli(args_target) -> DPOArgs:
     cls = args_target if isinstance(args_target, type) else args_target.__class__
     instance = args_target if not isinstance(args_target, type) else args_target()
 
+    int_fields = {
+        "vocab_size", "max_seq_len", "d_model", "n_layers", "n_heads", "n_kv_heads", "d_ffn",
+        "per_device_batch_size", "gradient_accumulation_steps", "epochs", "log_interval_steps",
+        "seed", "max_steps"
+    }
+    float_fields = {"beta", "learning_rate", "min_learning_rate", "max_grad_norm", "warmup_ratio", "dropout"}
+
     kwargs = {}
     for arg in sys.argv[1:]:
         if "=" in arg:
             k, v = arg.split("=", 1)
             k = k.lstrip("-")
             if hasattr(instance, k):
-                orig_val = getattr(instance, k)
-                if isinstance(orig_val, bool):
-                    kwargs[k] = v.lower() in ("true", "1", "yes")
-                elif isinstance(orig_val, int):
+                if k in int_fields:
                     kwargs[k] = int(v) if v.lower() != "none" else None
-                elif isinstance(orig_val, float):
+                elif k in float_fields:
                     kwargs[k] = float(v) if v.lower() != "none" else None
+                elif isinstance(getattr(instance, k), bool):
+                    kwargs[k] = v.lower() in ("true", "1", "yes")
                 else:
                     kwargs[k] = v if v.lower() != "none" else None
 
@@ -193,19 +255,45 @@ def train_dpo(args: DPOArgs):
     tokenizer = get_tokenizer(args.tokenizer_type, args.tokenizer_path)
     collator = DPODataCollator(pad_token_id=tokenizer.pad_token_id, pad_to_multiple_of=16)
 
-    if not os.path.exists(args.data_path):
-        print(f"[Notice] '{args.data_path}' not found. Initializing verification batch of 64 mock pairs.")
-        mock_data = [
-            {
-                "prompt": f"Question {i}: What is the capital of France?",
-                "chosen": "The capital of France is Paris.",
-                "rejected": "The capital of France is London and it has many people living in it.",
-            }
-            for i in range(64)
-        ]
-        dataset = PreferenceDataset(mock_data, tokenizer=tokenizer, max_seq_len=config.max_seq_len)
-    else:
-        dataset = PreferenceDataset(args.data_path, tokenizer=tokenizer, max_seq_len=config.max_seq_len)
+    dataset = None
+    if os.path.exists(args.data_path):
+        print(f"[Loading] Loading local preference dataset from '{args.data_path}'...")
+        try:
+            dataset = PreferenceDataset(args.data_path, tokenizer=tokenizer, max_seq_len=config.max_seq_len)
+        except Exception as e:
+            print(f"[Warning] Failed to load local path directly: {e}")
+
+    # Fallback to Hugging Face Hub if local file does not exist or failed
+    if dataset is None or len(dataset) == 0:
+        try:
+            from datasets import load_dataset
+            print(f"[DPO Data] Fetching dataset '{args.data_path}' from Hugging Face Hub...")
+            raw_ds = load_dataset(args.data_path, split="train")
+
+            formatted_data = []
+            for ex in raw_ds:
+                norm = normalize_preference_example(ex)
+                if norm:
+                    formatted_data.append(norm)
+
+            print(f"[DPO Data] Successfully parsed {len(formatted_data):,} preference pairs from '{args.data_path}'.")
+            dataset = PreferenceDataset(formatted_data, tokenizer=tokenizer, max_seq_len=config.max_seq_len)
+        except Exception as e:
+            print(f"[Notice] Could not load '{args.data_path}' from Hugging Face Hub ({e}).")
+            print("Initializing verification batch of 64 mock pairs.")
+            mock_data = [
+                {
+                    "prompt": f"Question {i}: What is the capital of France?",
+                    "chosen": "The capital of France is Paris.",
+                    "rejected": "The capital of France is London and it has many people living in it.",
+                }
+                for i in range(64)
+            ]
+            dataset = PreferenceDataset(mock_data, tokenizer=tokenizer, max_seq_len=config.max_seq_len)
+
+    print(f"[Dataset] Active preference dataset contains {len(dataset):,} samples.")
+    if len(dataset) < 100:
+        print("⚠️ Warning: Preference dataset is very small. Ensure production runs use a full dataset.")
 
     drop_last = len(dataset) >= args.per_device_batch_size
     loader = DataLoader(
@@ -229,6 +317,9 @@ def train_dpo(args: DPOArgs):
 
     steps_per_epoch = max(1, math.ceil(len(loader) / max(1, args.gradient_accumulation_steps)))
     total_steps = max(1, steps_per_epoch * args.epochs)
+    if args.max_steps is not None and args.max_steps > 0:
+        total_steps = min(total_steps, args.max_steps)
+
     warmup_steps = int(total_steps * args.warmup_ratio)
     global_step = 0
 
@@ -286,6 +377,12 @@ def train_dpo(args: DPOArgs):
                         f"Chosen R: {metrics['chosen_rewards'].item():.3f} | "
                         f"Rejected R: {metrics['rejected_rewards'].item():.3f}"
                     )
+
+                if global_step >= total_steps:
+                    break
+
+        if global_step >= total_steps:
+            break
 
     save_path = os.path.join(args.output_dir, "dpo_final.pt")
     torch.save(
