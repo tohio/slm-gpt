@@ -196,7 +196,7 @@ def main():
 
     cli_kwargs = parse_cli_args(sys.argv[1:])
     size_target = cli_kwargs.pop("size", "125M")
-    data_dir = cli_kwargs.pop("data_dir", "data/fineweb_125m")
+    data_dir = cli_kwargs.pop("data_dir", "data/pretrain")
     tok_type = cli_kwargs.pop("tokenizer_type", "tiktoken")
     tok_path = cli_kwargs.pop("tokenizer_path", None)
     eval_interval = cli_kwargs.pop("eval_interval", 1000)

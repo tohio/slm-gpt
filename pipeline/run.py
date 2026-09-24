@@ -26,8 +26,8 @@ class PipelineConfig:
     num_gpus: Optional[int] = None
     resume_from: Optional[str] = None  # None, "sft", or "dpo"
 
-    # Stage Data Paths
-    pretrain_data_dir: str = "data/fineweb_125m"
+    # Stage Data Paths (Decoupled, dataset-agnostic)
+    pretrain_data_dir: str = "data/pretrain"
     sft_data_path: str = "data/sft/train.jsonl"
     dpo_data_path: str = "data/dpo/preference_pairs.jsonl"
 
