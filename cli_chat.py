@@ -39,6 +39,8 @@ try:
 except AttributeError:
     pass
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="nvidia_cutlass_dsl")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="slm-gpt Interactive Chat CLI")
