@@ -191,7 +191,7 @@ def prepare_dataset(
 
     sys.stdout.flush()
     if exit_on_complete:
-        os._exit(0)
+        sys.exit(0)
 
 
 # Alias for backwards compatibility with test suite

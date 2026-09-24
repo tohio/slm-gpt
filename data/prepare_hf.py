@@ -123,7 +123,7 @@ def prepare_hf_stream(
 
     sys.stdout.flush()
     # Force hard-exit past lingering background HTTP socket thread loops
-    os._exit(0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
