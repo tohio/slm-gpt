@@ -45,10 +45,10 @@ def test_distributed_sharded_dataloader_disjoint(temp_bin_dataset):
 
     # Simulate Rank 0 and Rank 1 in a 2-GPU cluster
     loader_r0 = DistributedShardedDataLoader(
-        tmpdir, "train", batch_size=batch_size, seq_len=seq_len, rank=0, world_size=2, device=torch.device("cpu")
+        tmpdir, "train", B=batch_size, T=seq_len, process_rank=0, num_processes=2, device="cpu"
     )
     loader_r1 = DistributedShardedDataLoader(
-        tmpdir, "train", batch_size=batch_size, seq_len=seq_len, rank=1, world_size=2, device=torch.device("cpu")
+        tmpdir, "train", B=batch_size, T=seq_len, process_rank=1, num_processes=2, device="cpu"
     )
 
     x0, y0 = loader_r0.next_batch()
@@ -76,10 +76,12 @@ def test_pretrain_optimization_step(temp_bin_dataset):
     )
 
     model = DecoderOnlyTransformer(cfg.model_cfg)
-    optimizer = configure_optimizers(model, weight_decay=0.01, learning_rate=1e-3)
+    optimizer = configure_optimizers(
+        model, weight_decay=0.01, learning_rate=1e-3, betas=(0.9, 0.95), device_type="cpu"
+    )
 
     loader = DistributedShardedDataLoader(
-        tmpdir, "train", batch_size=cfg.micro_batch_size, seq_len=seq_len, rank=0, world_size=1, device=torch.device("cpu")
+        tmpdir, "train", B=cfg.micro_batch_size, T=seq_len, process_rank=0, num_processes=1, device="cpu"
     )
 
     # Initial weights snapshot
@@ -110,7 +112,7 @@ def test_estimate_loss_evaluation(temp_bin_dataset):
     model = DecoderOnlyTransformer(cfg.model_cfg)
 
     val_loader = DistributedShardedDataLoader(
-        tmpdir, "val", batch_size=2, seq_len=seq_len, rank=0, world_size=1, device=torch.device("cpu")
+        tmpdir, "val", B=2, T=seq_len, process_rank=0, num_processes=1, device="cpu"
     )
 
     val_loss = estimate_loss(model, val_loader, dtype=torch.float32, eval_iters=2)
