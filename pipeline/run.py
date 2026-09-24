@@ -1,10 +1,11 @@
 """
 pipeline/run.py: Autonomous End-to-End Pipeline Orchestrator for slm-gpt.
-Integrates HardwareProfiler to auto-detect compute capability, generate 
-tailored requirements, and auto-tune batching.
+Integrates HardwareProfiler, Stage 0 Data Ingestion & Packing, and 
+sequential Pre-training -> SFT -> DPO execution with Health Gates.
 """
 
 from dataclasses import dataclass
+import glob
 import os
 import subprocess
 import sys
@@ -26,12 +27,17 @@ class PipelineConfig:
     num_gpus: Optional[int] = None
     resume_from: Optional[str] = None  # None, "sft", or "dpo"
 
-    # Stage Data Paths (Decoupled, dataset-agnostic)
+    # Stage Data Paths
     pretrain_data_dir: str = "data/pretrain"
     sft_data_path: str = "data/sft/train.jsonl"
     dpo_data_path: str = "data/dpo/preference_pairs.jsonl"
 
-    # Stage Budgets
+    # Stage 0 Data Budgets (Used if data is missing on cold-start)
+    bootstrap_pretrain_tokens: int = 10_000_000
+    bootstrap_sft_samples: int = 5_000
+    bootstrap_dpo_samples: int = 2_000
+
+    # Training Budgets
     pretrain_max_steps: Optional[int] = None
     sft_epochs: int = 3
     dpo_epochs: int = 1
@@ -121,6 +127,67 @@ class PipelineOrchestrator:
         except Exception as e:
             print(f"❌ Health Gate Error: Failed to deserialize '{path}': {e}")
             return False
+
+    def ensure_data_prepared(self):
+        """Stage 0: Autonomous Cold-Start Data Ingestion & Packing Gate."""
+        self.print_stage_banner("0. Autonomous Data Ingestion & Verification")
+
+        # 0A. Pre-training Shard Check
+        has_train = bool(
+            os.path.exists(os.path.join(self.cfg.pretrain_data_dir, "train.bin"))
+            or glob.glob(os.path.join(self.cfg.pretrain_data_dir, "train_*.bin"))
+        )
+        has_val = bool(
+            os.path.exists(os.path.join(self.cfg.pretrain_data_dir, "val.bin"))
+            or glob.glob(os.path.join(self.cfg.pretrain_data_dir, "val_*.bin"))
+        )
+
+        if not (has_train and has_val) and self.cfg.resume_from not in ("sft", "dpo"):
+            print(f"⚠️ Pre-training binary shards missing in '{self.cfg.pretrain_data_dir}'.")
+            print(f"   Executing token packing curriculum target: {self.cfg.bootstrap_pretrain_tokens:,} tokens...")
+            cmd = [
+                sys.executable,
+                "data/prepare_packed_curriculum.py",
+                f"output_dir={self.cfg.pretrain_data_dir}",
+                f"total_tokens={self.cfg.bootstrap_pretrain_tokens}",
+            ]
+            ret = subprocess.run(cmd)
+            if ret.returncode != 0:
+                raise RuntimeError("Stage 0: Pre-training token packing failed.")
+        else:
+            print(f"✓ Pre-training shards verified in '{self.cfg.pretrain_data_dir}'")
+
+        # 0B. SFT Dialogue Check
+        if not os.path.exists(self.cfg.sft_data_path) and self.cfg.resume_from != "dpo":
+            print(f"⚠️ SFT dataset missing at '{self.cfg.sft_data_path}'. Ingesting SmolTalk...")
+            out_dir = os.path.dirname(self.cfg.sft_data_path) or "data/sft"
+            cmd = [
+                sys.executable,
+                "data/prepare_sft.py",
+                "--source=HuggingFaceTB/smoltalk",
+                f"--output_dir={out_dir}",
+                f"--max_samples={self.cfg.bootstrap_sft_samples}",
+            ]
+            ret = subprocess.run(cmd)
+            if ret.returncode != 0:
+                raise RuntimeError("Stage 0: SFT dataset preparation failed.")
+        else:
+            print(f"✓ SFT dataset verified at '{self.cfg.sft_data_path}'")
+
+        # 0C. DPO Preference Check
+        if not os.path.exists(self.cfg.dpo_data_path):
+            print(f"⚠️ DPO dataset missing at '{self.cfg.dpo_data_path}'. Extracting preference pairs...")
+            cmd = [
+                sys.executable,
+                "data/prepare_dpo.py",
+                f"--output_path={self.cfg.dpo_data_path}",
+                f"--max_samples={self.cfg.bootstrap_dpo_samples}",
+            ]
+            ret = subprocess.run(cmd)
+            if ret.returncode != 0:
+                raise RuntimeError("Stage 0: DPO dataset preparation failed.")
+        else:
+            print(f"✓ DPO dataset verified at '{self.cfg.dpo_data_path}'")
 
     def run_pretrain(self):
         self.print_stage_banner("1. Pre-training (Multi-GPU DDP)")
@@ -220,6 +287,10 @@ class PipelineOrchestrator:
         print(f"Alignment Compute:      Single-GPU (SFT & DPO)")
         print("=" * 70)
 
+        # Stage 0: Data verification & bootstrap
+        self.ensure_data_prepared()
+
+        # Stages 1-3: Core training pipeline
         self.run_pretrain()
         self.run_sft()
         self.run_dpo()

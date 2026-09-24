@@ -1,7 +1,7 @@
 """
-data/prepare_packed_curriculum.py: Approach A Physical Token Interleaving.
-Streams and packs the Option 1A 5-source curriculum into fixed-size .bin shards.
-Uses Token-Deficit Scheduling to guarantee exact 48/20/15/15/2 token distribution.
+data/prepare_packed_curriculum.py: Physical Token Interleaving.
+Streams and packs the multi-source curriculum into fixed-size .bin shards.
+Uses Token-Deficit Scheduling to guarantee exact curriculum distribution.
 """
 
 import glob
@@ -56,7 +56,6 @@ class HFStreamReader(SourceReader):
                 ds = load_dataset(self.repo, **kwargs)
 
             for item in ds:
-                # Handle varying text keys across different Hugging Face schemas
                 text = (
                     item.get(self.text_key)
                     or item.get("text")
@@ -74,7 +73,7 @@ class HFStreamReader(SourceReader):
 
 class LocalBinReader(SourceReader):
     """Reads pre-tokenized documents from local .bin files."""
-    def __init__(self, name: str, directory: str, weight: float, eot_token_id: int, dtype: np.dtype = np.uint32):
+    def __init__(self, name: str, directory: str, weight: float, eot_token_id: int, dtype: np.dtype = np.uint16):
         super().__init__(name, weight)
         self.directory = directory
         self.eot_token_id = eot_token_id
@@ -106,17 +105,13 @@ class LocalBinReader(SourceReader):
 
 def pack_curriculum_to_shards(
     sources: List[SourceReader],
-    output_dir: str = "data/pretrain_packed",
-    total_token_budget: int = 10_000_000_000,
-    shard_size_tokens: int = 50_000_000,
+    output_dir: str = "data/pretrain",
+    total_token_budget: int = 100_000_000,
+    shard_size_tokens: int = 25_000_000,
+    val_tokens: int = 500_000,
     tokenizer_type: str = "tiktoken",
     tokenizer_path: Optional[str] = None,
-    seed: int = 42,
 ):
-    """
-    Physically packs multiple sources into contiguous .bin files using token-deficit scheduling.
-    Guarantees that final token distributions strictly match curriculum targets.
-    """
     os.makedirs(output_dir, exist_ok=True)
     tokenizer = get_tokenizer(tokenizer_type, tokenizer_path)
     eot_id = tokenizer.eot_id
@@ -126,10 +121,11 @@ def pack_curriculum_to_shards(
     target_proportions = [w / total_weight for w in raw_weights]
 
     print("=" * 70)
-    print("      slm-gpt Physical Token Packing Engine (Option 1A)")
+    print("      slm-gpt Physical Token Packing Engine (Standardized)")
     print("=" * 70)
-    print(f"Total Token Target:  {total_token_budget:,}")
-    print(f"Shard Size:          {shard_size_tokens:,} tokens ({shard_size_tokens * 4 / (1024**2):.1f} MB)")
+    print(f"Total Train Target:  {total_token_budget:,} tokens")
+    print(f"Validation Target:   {val_tokens:,} tokens")
+    print(f"Shard Size:          {shard_size_tokens:,} tokens ({shard_size_tokens * 2 / (1024**2):.1f} MB in uint16)")
     print(f"Output Directory:    {output_dir}")
     print("Target Curriculum:")
     for s, p in zip(sources, target_proportions):
@@ -139,12 +135,30 @@ def pack_curriculum_to_shards(
     generators = [s.stream_docs(tokenizer) for s in sources]
     tokens_per_source = [0] * len(sources)
 
+    # 1. Harvest validation tokens first so pretrain/train.py never asserts on missing val split
+    print("Extracting validation partition...")
+    val_buffer: List[int] = []
+    source_idx = 0
+    while len(val_buffer) < val_tokens:
+        try:
+            doc = next(generators[source_idx % len(sources)])
+            val_buffer.extend(doc)
+            val_buffer.append(eot_id)
+        except StopIteration:
+            generators[source_idx % len(sources)] = sources[source_idx % len(sources)].stream_docs(tokenizer)
+        source_idx += 1
+
+    val_data = np.array(val_buffer[:val_tokens], dtype=np.uint16)
+    val_file = os.path.join(output_dir, "val_00000.bin")
+    val_data.tofile(val_file)
+    print(f"✓ Wrote validation shard: {val_file} ({len(val_data):,} tokens)")
+
+    # 2. Pack Training Shards (uint16 + train_XXXXX.bin pattern)
     token_buffer: List[int] = []
     shard_idx = 0
     total_tokens_written = 0
 
     while total_tokens_written + len(token_buffer) < total_token_budget:
-        # Token-Deficit Selection: Pick source farthest below its target ratio
         total_so_far = max(1, sum(tokens_per_source))
         deficits = [
             target_proportions[i] - (tokens_per_source[i] / total_so_far)
@@ -155,22 +169,19 @@ def pack_curriculum_to_shards(
         try:
             doc_tokens = next(generators[chosen_idx])
         except StopIteration:
-            # Re-instantiate iterator when a source is exhausted (cyclic upsampling)
             generators[chosen_idx] = sources[chosen_idx].stream_docs(tokenizer)
             try:
                 doc_tokens = next(generators[chosen_idx])
             except StopIteration:
                 continue
 
-        # Append document + <|endoftext|> delimiter
         token_buffer.extend(doc_tokens)
         token_buffer.append(eot_id)
         tokens_per_source[chosen_idx] += len(doc_tokens) + 1
 
-        # Flush full shards
         while len(token_buffer) >= shard_size_tokens:
-            shard_data = np.array(token_buffer[:shard_size_tokens], dtype=np.uint32)
-            out_file = os.path.join(output_dir, f"shard_{shard_idx:05d}.bin")
+            shard_data = np.array(token_buffer[:shard_size_tokens], dtype=np.uint16)
+            out_file = os.path.join(output_dir, f"train_{shard_idx:05d}.bin")
             shard_data.tofile(out_file)
 
             total_tokens_written += shard_size_tokens
@@ -182,29 +193,26 @@ def pack_curriculum_to_shards(
             if total_tokens_written >= total_token_budget:
                 break
 
-    # Flush remainder
+    # Remainder shard
     if token_buffer and total_tokens_written < total_token_budget:
-        shard_data = np.array(token_buffer, dtype=np.uint32)
-        out_file = os.path.join(output_dir, f"shard_{shard_idx:05d}.bin")
+        shard_data = np.array(token_buffer, dtype=np.uint16)
+        out_file = os.path.join(output_dir, f"train_{shard_idx:05d}.bin")
         shard_data.tofile(out_file)
         total_tokens_written += len(shard_data)
         print(f"✓ Wrote final remainder shard: {out_file} | Total: {total_tokens_written:,} tokens")
 
     print("=" * 70)
-    print(f"Physical packing complete. Total tokens: {total_tokens_written:,}")
+    print(f"Physical packing complete. Total train tokens: {total_tokens_written:,}")
     print("=" * 70)
 
 
 def build_default_curriculum(upstream_dir: Optional[str] = None) -> List[SourceReader]:
-    """Builds the Option 1A 5-source curriculum."""
     if upstream_dir and os.path.exists(upstream_dir):
-        # Optional override if using a local directory from slm/curator
         return [
-            LocalBinReader("Local Curated Shards", upstream_dir, weight=0.98, eot_token_id=50256),
+            LocalBinReader("Local Curated Shards", upstream_dir, weight=0.98, eot_token_id=50256, dtype=np.uint16),
             HFStreamReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=0.02),
         ]
 
-    # Standard Option 1A Production Baseline
     return [
         HFStreamReader("FineWeb-Edu", "HuggingFaceFW/fineweb-edu", "sample-10BT", "text", weight=0.48),
         HFStreamReader("Cosmopedia v2", "HuggingFaceTB/cosmopedia-v2", "default", "text", weight=0.20),
@@ -215,18 +223,21 @@ def build_default_curriculum(upstream_dir: Optional[str] = None) -> List[SourceR
 
 
 if __name__ == "__main__":
-    tokens_target = 100_000_000  # Default 100M for dry runs
+    tokens_target = 100_000_000
     custom_dir = None
+    target_out = "data/pretrain"
 
     for arg in sys.argv[1:]:
         if arg.startswith("total_tokens="):
             tokens_target = int(arg.split("=")[1])
         elif arg.startswith("upstream_dir="):
             custom_dir = arg.split("=")[1]
+        elif arg.startswith("output_dir="):
+            target_out = arg.split("=")[1]
 
     curriculum = build_default_curriculum(upstream_dir=custom_dir)
     pack_curriculum_to_shards(
         sources=curriculum,
-        output_dir="data/pretrain_packed",
+        output_dir=target_out,
         total_token_budget=tokens_target,
     )
