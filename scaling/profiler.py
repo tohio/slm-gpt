@@ -23,7 +23,7 @@ BASE_DEPENDENCIES: List[str] = [
     "python-dotenv>=1.0.0",
     "packaging>=23.0",
     "ninja>=1.11.0",
-    "psutil",
+    "psutil",  # Required for FlashAttention build & core counting
     "wandb",
     "numpy>=1.26.0",
     "tiktoken>=0.7.0",
@@ -245,6 +245,33 @@ class HardwareProfiler:
                 print(f"[HardwareProfiler] Build error for {pkg_desc}: {e}")
 
         print("[HardwareProfiler] Notice: Operating under PyTorch-Native-SDPA.")
+
+
+# =====================================================================
+# Memory-Aware Micro-Batch Auto-Tuning
+# =====================================================================
+def tune_micro_batch_size(
+    target_params: int,
+    max_seq_len: int,
+    total_memory_gb: float,
+    world_size: int = 1,
+    vocab_size: int = 50304,
+) -> int:
+    """Auto-tunes micro-batch size based on device memory and sequence length."""
+    static_gb = (target_params * 14) / (1024 ** 3) + 2.0
+    usable_vram = max(0.5, (total_memory_gb * 0.75) - static_gb)
+
+    vocab_workspace_bytes = max_seq_len * vocab_size * 10
+    activation_bytes = max_seq_len * 768 * 90
+    per_sample_gb = (vocab_workspace_bytes + activation_bytes) / (1024 ** 3)
+
+    estimated_batch = int(usable_vram / max(per_sample_gb, 0.1))
+
+    powers = [16, 8, 4, 2, 1] if max_seq_len >= 2048 else [32, 16, 8, 4, 2, 1]
+    for p in powers:
+        if estimated_batch >= p:
+            return p
+    return 1
 
 
 # =====================================================================
