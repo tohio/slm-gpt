@@ -65,7 +65,8 @@ def test_filter_length_exploits():
     """Verify that completions with extreme length disparity are rejected to prevent verbosity hacking."""
     exploit_sample = {
         "prompt": "Explain gravity.",
-        "chosen": "Gravity is " + "a fundamental force that attracts objects " * 50,  # > 350 words, >> len(rejected)
+        # 70 repetitions * 6 words + 2 = 422 words (> 350-word filter threshold)
+        "chosen": "Gravity is " + "a fundamental force that attracts objects " * 70,
         "rejected": "Gravity pulls things down.",
     }
     assert normalize_preference_record(exploit_sample) is None
@@ -93,3 +94,7 @@ def test_prepare_dpo_jsonl_roundtrip():
         assert len(lines) == 1
         assert len(tokenizer.encode(lines[0]["prompt"])) > 0
         assert len(tokenizer.encode(lines[0]["chosen"])) > 0
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

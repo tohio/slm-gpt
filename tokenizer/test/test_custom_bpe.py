@@ -1,3 +1,8 @@
+"""
+tokenizer/test/test_custom_bpe.py: Unit tests for CustomBPETokenizer.
+Tests training, lossless roundtrip decoding, and serialization save/load contracts.
+"""
+
 import sys
 from pathlib import Path
 import tempfile
@@ -15,7 +20,7 @@ def test_bpe_roundtrip_and_training():
     ) * 10
 
     tokenizer = CustomBPETokenizer()
-    target_vocab = 300  # 256 base bytes + 44 merges
+    target_vocab = 300  # 256 base bytes + 17 special tokens + 27 merges
     tokenizer.train(corpus, vocab_size=target_vocab)
 
     assert tokenizer.vocab_size == target_vocab, (
@@ -39,7 +44,8 @@ def test_bpe_roundtrip_and_training():
 def test_save_and_load():
     corpus = "Machine learning with PyTorch and Python." * 5
     tok1 = CustomBPETokenizer()
-    tok1.train(corpus, vocab_size=270)
+    # Must be >= 256 base bytes + 17 special tokens = 273; 280 allocates 7 learned merges
+    tok1.train(corpus, vocab_size=280)
 
     sample = "Machine learning test."
     expected_ids = tok1.encode(sample)
