@@ -21,20 +21,28 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from dotenv import load_dotenv
 import wandb
 
-# Ensure repository root is on sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Ensure repository root and package directories are on sys.path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 load_dotenv()
 
 from scaling.config import RuntimeConfig
 from tokenizer.factory import get_tokenizer
 
+# Robust multi-path resolution for Transformer architecture definition
 try:
-    from model.transformer import Transformer, TransformerConfig
+    from transformer.model import Transformer, TransformerConfig
 except ImportError:
     try:
-        from core.model import Transformer, TransformerConfig
+        from transformer import Transformer, TransformerConfig
     except ImportError:
-        from model import Transformer, TransformerConfig
+        try:
+            from model.transformer import Transformer, TransformerConfig
+        except ImportError:
+            try:
+                from core.model import Transformer, TransformerConfig
+            except ImportError:
+                from model import Transformer, TransformerConfig
 
 
 class DistributedShardedDataLoader:
