@@ -169,8 +169,10 @@ class HardwareProfiler:
             f"# Architecture:      {profile.arch_generation}",
             f"# Total Memory:      {profile.total_memory_gb:.1f} GB",
             f"# Precision Target:  {profile.precision_str}",
-            "# ===================================================================\n",
         ]
+        if profile.compute_capability:
+            lines.append(f"# CUDA SM:           {profile.compute_capability[0]}.{profile.compute_capability[1]}")
+        lines.append("# ===================================================================\n")
 
         if profile.wheel_index_url:
             lines.append(f"--extra-index-url {profile.wheel_index_url}\n")
@@ -182,14 +184,18 @@ class HardwareProfiler:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        print(f"[HardwareProfiler] Wrote dependencies for {profile.arch_generation} to {output_path}")
+        print(f"[HardwareProfiler] Wrote architecture dependencies to {output_path}")
         return output_path
 
     @classmethod
     def auto_install_environment(cls):
         profile = cls.profile()
+        print(f"[HardwareProfiler] Detected platform: {profile.arch_generation}")
 
-        # Step 1: Verify core dependencies
+        # Step 1: Always update requirements.txt on invocation
+        cls.generate_requirements_file()
+
+        # Step 2: Verify and install missing core dependencies
         core_checks = {
             "regex": "regex",
             "numpy": "numpy",
@@ -202,27 +208,28 @@ class HardwareProfiler:
         missing_core = [pkg for pkg, mod in core_checks.items() if importlib.util.find_spec(mod) is None]
 
         if missing_core:
-            print(f"[HardwareProfiler] Cold-start detected on {profile.arch_generation}.")
             print(f"[HardwareProfiler] Missing core packages: {missing_core}. Auto-installing...")
-            req_file = cls.generate_requirements_file()
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", req_file])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+            print("[HardwareProfiler] ✓ Core packages installed.")
+        else:
             print("[HardwareProfiler] ✓ Core packages verified.")
 
-        # Step 2: Skip FA checks for MPS and CPU
+        # Step 3: Check attention backend candidates
         if not profile.fa_candidates:
+            print("[HardwareProfiler] Notice: Operating under PyTorch-Native-SDPA.")
             return
 
-        # Step 3: Check if an FA candidate is already installed and importable
         for mod_name, _ in profile.fa_candidates:
             root_mod = mod_name.split(".")[0]
             if importlib.util.find_spec(root_mod) is not None:
                 try:
                     __import__(mod_name)
+                    print(f"[HardwareProfiler] ✓ Verified active attention backend: {mod_name}")
                     return
                 except Exception:
                     pass
 
-        # Step 4: Probing candidate backends in priority order
+        # Step 4: Probing candidates if none are installed
         for mod_name, pip_args in profile.fa_candidates:
             pkg_desc = " ".join(pip_args[1:])
             print(f"[HardwareProfiler] Probing hardware backend candidate: {pkg_desc}...")
@@ -230,11 +237,29 @@ class HardwareProfiler:
                 cmd = [sys.executable, "-m", "pip"] + pip_args
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                 if res.returncode == 0:
-                    print(f"[HardwareProfiler] ✓ Successfully activated {mod_name}.")
+                    print(f"[HardwareProfiler] ✓ Successfully installed and activated {mod_name}.")
                     return
                 else:
-                    print(f"[HardwareProfiler] Candidate {pkg_desc} failed. Trying next...")
+                    print(f"[HardwareProfiler] Candidate {pkg_desc} failed install. Trying next...")
             except Exception as e:
                 print(f"[HardwareProfiler] Build error for {pkg_desc}: {e}")
 
         print("[HardwareProfiler] Notice: Operating under PyTorch-Native-SDPA.")
+
+
+# =====================================================================
+# CLI Entrypoint: Enables direct execution via `python -m scaling.profiler`
+# =====================================================================
+if __name__ == "__main__":
+    HardwareProfiler.auto_install_environment()
+    prof = HardwareProfiler.profile()
+    print("\n" + "=" * 60)
+    print(" HARDWARE PROFILE SUMMARY")
+    print("=" * 60)
+    print(f" Device:             {prof.device_name}")
+    print(f" Architecture:       {prof.arch_generation}")
+    print(f" Total Memory:       {prof.total_memory_gb:.1f} GB")
+    print(f" Precision Target:   {prof.precision_str}")
+    if prof.compute_capability:
+        print(f" Compute Capability: SM {prof.compute_capability[0]}.{prof.compute_capability[1]}")
+    print("=" * 60 + "\n")

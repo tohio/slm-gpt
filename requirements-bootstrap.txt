@@ -1,5 +1,6 @@
 # Minimum toolchain to profile hardware and build kernels
 torch
+numpy
 packaging>=23.0
 ninja>=1.11.0
 python-dotenv>=1.0.0
