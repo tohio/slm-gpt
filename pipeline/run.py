@@ -40,7 +40,7 @@ class PipelineConfig:
     pretrain_data_dir: str = "data/pretrain"
     sft_data_path: str = "data/sft/train.jsonl"
     dpo_data_path: str = "data/dpo/preference_pairs.jsonl"
-    dpo_dataset: Optional[str] = None  # Remote HF dataset override (e.g. 'HuggingFaceH4/dpo-mix-7k')
+    dpo_dataset: Optional[str] = "argilla/dpo-mix-7k"  # Verified default preference dataset
 
     # Stage 0 Data Budgets (Used if data is missing on cold-start)
     bootstrap_pretrain_tokens: int = 10_000_000
@@ -144,7 +144,7 @@ class PipelineOrchestrator:
             return False
         try:
             ckpt = torch.load(path, map_location="cpu", weights_only=False)
-            if "model_state_dict" not in ckpt and not isinstance(ckpt, dict):
+            if "model_state_dict" not in ckpt and "model" not in ckpt and not isinstance(ckpt, dict):
                 print(f"❌ Health Gate Error: Invalid checkpoint structure at '{path}'")
                 return False
             return True
@@ -225,6 +225,7 @@ class PipelineOrchestrator:
                     cmd = [
                         sys.executable,
                         "-m", "data.prepare_dpo",
+                        "--dataset_name=argilla/dpo-mix-7k",
                         f"--output_path={self.cfg.dpo_data_path}",
                         f"--max_samples={self.cfg.bootstrap_dpo_samples}",
                     ]
@@ -232,11 +233,10 @@ class PipelineOrchestrator:
                     if ret.returncode != 0:
                         raise RuntimeError("Stage 0: DPO dataset preparation failed.")
                 else:
-                    # Direct ingestion of dpo-mix-7k to local jsonl
                     try:
                         from datasets import load_dataset
-                        print("   Downloading 'HuggingFaceH4/dpo-mix-7k' from Hugging Face Hub...")
-                        ds = load_dataset("HuggingFaceH4/dpo-mix-7k", split="train")
+                        print("   Downloading 'argilla/dpo-mix-7k' from Hugging Face Hub...")
+                        ds = load_dataset("argilla/dpo-mix-7k", split="train")
                         ds.to_json(self.cfg.dpo_data_path, orient="records", lines=True)
                         print(f"✓ Ingested {len(ds):,} pairs into '{self.cfg.dpo_data_path}'")
                     except Exception as e:

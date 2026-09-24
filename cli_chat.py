@@ -6,9 +6,11 @@ Adheres strictly to the slm-gpt model and tokenizer contracts:
 - RoPE KV-cache stepping via forward(next_token, kv_caches=kv_caches)
 - Native ChatML formatting matching sft/dataset.py
 - PyTorch 2.6+ safe checkpoint deserialization
+- Backward-compatible dynamic dtype derivation (bfloat16 for FlashAttention-4, float32 for CPU/MPS)
 """
 
 import argparse
+from contextlib import nullcontext
 from dataclasses import fields
 import os
 import sys
@@ -81,8 +83,18 @@ def parse_args():
 
 
 def load_model(checkpoint_path: str, device: str) -> Tuple[DecoderOnlyTransformer, ModelConfig]:
+    """
+    Restores model weights, enforces weight-tying invariants, and casts to target precision.
+    Maintains the 2-tuple (model, cfg) signature for backward compatibility.
+    """
     if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
+        # Fallback to SFT final checkpoint if DPO checkpoint is absent
+        fallback = os.path.join(os.path.dirname(checkpoint_path).replace("dpo_", "sft_"), "sft_final.pt")
+        if os.path.exists(fallback):
+            print(f"[Notice] '{checkpoint_path}' not found. Falling back to '{fallback}'.")
+            checkpoint_path = fallback
+        else:
+            raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
 
     print(f"[Loading] Restoring weights from '{checkpoint_path}'...")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -108,13 +120,18 @@ def load_model(checkpoint_path: str, device: str) -> Tuple[DecoderOnlyTransforme
             bias=False,
         )
 
-    # Force inference mode
     cfg.dropout = 0.0
 
-    dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
-    model = DecoderOnlyTransformer(cfg).to(device=device, dtype=dtype)
+    # Determine execution precision
+    is_cuda = "cuda" in str(device).lower() and torch.cuda.is_available()
+    if is_cuda:
+        target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        target_dtype = torch.float32
 
-    # Extract state dict across diverse checkpoint formats
+    model = DecoderOnlyTransformer(cfg)
+
+    # Extract state dict across diverse checkpoint conventions
     if isinstance(ckpt, dict):
         state_dict = ckpt.get("model_state_dict", ckpt.get("model", ckpt))
     else:
@@ -122,15 +139,17 @@ def load_model(checkpoint_path: str, device: str) -> Tuple[DecoderOnlyTransforme
 
     model.load_state_dict(state_dict, strict=False)
 
-    # Enforce tied embeddings explicitly
+    # Explicitly re-tie embeddings and cast to target precision
     model.lm_head.weight = model.wte.weight
+    model = model.to(device=device, dtype=target_dtype)
+    model.eval()
+
     assert model.wte.weight.data_ptr() == model.lm_head.weight.data_ptr(), (
         "Weight tying invariant broken: wte and lm_head do not share memory."
     )
 
-    model.eval()
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"✓ Model initialized ({cfg.n_layers} layers, {total_params:,} parameters on {device.upper()}).")
+    print(f"✓ Model initialized ({cfg.n_layers} layers, {total_params:,} parameters on {str(device).upper()} in {target_dtype}).")
     return model, cfg
 
 
@@ -147,18 +166,27 @@ def generate_stream(
 ) -> List[int]:
     """
     Streams generated tokens to stdout using layerwise RoPE KV-caching.
-    Applies standard repetition penalty across the active sequence context.
+    Applies full-context repetition penalty and dynamic autocast context.
     """
     model.eval()
     im_end_id = getattr(tokenizer, "im_end_id", 50257)
     eot_id = getattr(tokenizer, "eot_id", 50256)
 
+    # Infer runtime dtype and backend dynamically from model weights
+    dtype = next(model.parameters()).dtype
+    device_str = str(device).lower()
+    is_cuda = "cuda" in device_str and torch.cuda.is_available()
+    use_autocast = is_cuda and (dtype in (torch.bfloat16, torch.float16))
+
+    # Safe nullcontext fallback for CPU and Apple Silicon MPS
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=dtype) if use_autocast else nullcontext()
+
     idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
-    # 1. Prefill phase: compute KV caches for full prompt context
-    with torch.no_grad():
+    # 1. Prefill phase: compute initial KV caches for full prompt context
+    with torch.no_grad(), autocast_ctx:
         logits, _, kv_caches = model(idx)
-        logits = logits[:, -1, :]
+        logits = logits[:, -1, :].float()
 
     generated_ids: List[int] = []
 
@@ -211,9 +239,9 @@ def generate_stream(
             break
 
         # 3. Step forward single token with accumulated RoPE KV caches
-        with torch.no_grad():
+        with torch.no_grad(), autocast_ctx:
             logits, _, kv_caches = model(next_token, kv_caches=kv_caches)
-            logits = logits[:, -1, :]
+            logits = logits[:, -1, :].float()
 
     sys.stdout.write("\n")
     sys.stdout.flush()
@@ -240,15 +268,17 @@ def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    tokenizer = get_tokenizer("tiktoken")
+    model, cfg = load_model(args.checkpoint, device)
+
+    dtype = next(model.parameters()).dtype
     print("=" * 65)
     print("           slm-gpt Interactive Chat Interface              ")
     print(f" Checkpoint: {args.checkpoint}")
-    print(f" Device:     {device.upper()} | Temp: {args.temperature} | Rep Penalty: {args.repetition_penalty}")
+    print(f" Device:     {device.upper()} ({dtype})")
+    print(f" Sampling:   Temp={args.temperature} | Top-P={args.top_p} | Top-K={args.top_k} | Rep-Penalty={args.repetition_penalty}")
     print(" Commands:   'clear' to reset dialogue, 'exit' or 'quit' to end.")
     print("=" * 65)
-
-    tokenizer = get_tokenizer("tiktoken")
-    model, cfg = load_model(args.checkpoint, device)
 
     messages: List[Dict[str, str]] = []
     if args.system_prompt.strip():
@@ -281,7 +311,7 @@ def main():
         messages.append({"role": "user", "content": user_input})
         prompt_ids = build_chatml_prompt(messages, tokenizer)
 
-        # Context truncation: drop oldest dialogue pairs if nearing context limit
+        # Context window truncation: slide window if approaching context limit
         while len(prompt_ids) >= cfg.max_seq_len - args.max_new_tokens and len(messages) > 1:
             drop_idx = 1 if messages[0]["role"] == "system" else 0
             messages.pop(drop_idx)
