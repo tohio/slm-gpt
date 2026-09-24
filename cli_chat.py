@@ -19,9 +19,14 @@ import torch.nn.functional as F
 import torch.serialization
 
 try:
-    from tokenizer.tiktoken_wrap import PretrainedTiktokenTokenizer
+    from tokenizer.factory import get_tokenizer
 except ImportError:
-    from tokenizer.tiktoken_tokenizer import PretrainedTiktokenTokenizer
+    try:
+        from tokenizer.tiktoken_wrap import PretrainedTiktokenTokenizer as _Tok
+        get_tokenizer = lambda t="tiktoken", p=None: _Tok()
+    except ImportError:
+        from tokenizer.tiktoken_tokenizer import PretrainedTiktokenTokenizer as _Tok
+        get_tokenizer = lambda t="tiktoken", p=None: _Tok()
 
 from transformer.config import ModelConfig
 from transformer.model import DecoderOnlyTransformer
@@ -38,7 +43,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/sft_125m/sft_epoch_2.pt",
+        default="checkpoints/dpo_127M/dpo_final.pt",
         help="Path to model checkpoint",
     )
     parser.add_argument(
@@ -87,7 +92,7 @@ def load_model(checkpoint_path: str, device: str) -> Tuple[DecoderOnlyTransforme
 
     if isinstance(cfg_raw, ModelConfig):
         cfg = cfg_raw
-    elif isinstance(cfg_raw, dict):
+    elif isinstance(cfg_raw, dict) and cfg_raw:
         filtered = {k: v for k, v in cfg_raw.items() if k in valid_field_names}
         cfg = ModelConfig(**filtered)
     else:
@@ -103,23 +108,35 @@ def load_model(checkpoint_path: str, device: str) -> Tuple[DecoderOnlyTransforme
             bias=False,
         )
 
-    model = DecoderOnlyTransformer(cfg).to(device)
-    model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
+    # Force inference mode
+    cfg.dropout = 0.0
 
-    # Invariant: Verify tied embeddings
+    dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
+    model = DecoderOnlyTransformer(cfg).to(device=device, dtype=dtype)
+
+    # Extract state dict across diverse checkpoint formats
+    if isinstance(ckpt, dict):
+        state_dict = ckpt.get("model_state_dict", ckpt.get("model", ckpt))
+    else:
+        state_dict = ckpt
+
+    model.load_state_dict(state_dict, strict=False)
+
+    # Enforce tied embeddings explicitly
+    model.lm_head.weight = model.wte.weight
     assert model.wte.weight.data_ptr() == model.lm_head.weight.data_ptr(), (
         "Weight tying invariant broken: wte and lm_head do not share memory."
     )
 
     model.eval()
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"✓ Model initialized ({cfg.n_layers} layers, {total_params:,} parameters).")
+    print(f"✓ Model initialized ({cfg.n_layers} layers, {total_params:,} parameters on {device.upper()}).")
     return model, cfg
 
 
 def generate_stream(
     model: DecoderOnlyTransformer,
-    tokenizer: PretrainedTiktokenTokenizer,
+    tokenizer,
     prompt_ids: List[int],
     max_new_tokens: int,
     temperature: float,
@@ -130,11 +147,11 @@ def generate_stream(
 ) -> List[int]:
     """
     Streams generated tokens to stdout using layerwise RoPE KV-caching.
-    Applies standard repetition penalty across the active sequence context (idx).
+    Applies standard repetition penalty across the active sequence context.
     """
     model.eval()
-    im_end_id = tokenizer.im_end_id
-    eot_id = tokenizer.eot_id
+    im_end_id = getattr(tokenizer, "im_end_id", 50257)
+    eot_id = getattr(tokenizer, "eot_id", 50256)
 
     idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
@@ -147,7 +164,7 @@ def generate_stream(
 
     # 2. Sequential decode phase: 1 token per forward step
     for _ in range(max_new_tokens):
-        # Full-context repetition penalty: penalizes any token present in the active dialogue
+        # Full-context repetition penalty
         if repetition_penalty != 1.0:
             for token_id in set(idx[0].tolist()):
                 if logits[0, token_id] > 0:
@@ -179,13 +196,11 @@ def generate_stream(
 
         token_val = next_token.item()
 
-        # Append token to tracking tensor first (maintains accurate context & sequence length)
-        idx = torch.cat((idx, next_token), dim=1)
-
         # Stop condition: <|im_end|> or <|endoftext|>
         if token_val in (im_end_id, eot_id):
             break
 
+        idx = torch.cat((idx, next_token), dim=1)
         generated_ids.append(token_val)
 
         # Stream decoded token chunk to terminal
@@ -195,7 +210,7 @@ def generate_stream(
         if idx.size(1) >= model.config.max_seq_len:
             break
 
-        # 3. Next step: forward single token with accumulated RoPE KV caches
+        # 3. Step forward single token with accumulated RoPE KV caches
         with torch.no_grad():
             logits, _, kv_caches = model(next_token, kv_caches=kv_caches)
             logits = logits[:, -1, :]
@@ -205,7 +220,7 @@ def generate_stream(
     return generated_ids
 
 
-def build_chatml_prompt(messages: List[Dict[str, str]], tokenizer: PretrainedTiktokenTokenizer) -> List[int]:
+def build_chatml_prompt(messages: List[Dict[str, str]], tokenizer) -> List[int]:
     """Encodes conversation turns into canonical ChatML tokens."""
     tokens = []
     for msg in messages:
@@ -227,11 +242,12 @@ def main():
 
     print("=" * 65)
     print("           slm-gpt Interactive Chat Interface              ")
-    print(f" Device: {device.upper()} | Temp: {args.temperature} | Rep Penalty: {args.repetition_penalty}")
-    print(" Commands: 'clear' to reset dialogue, 'exit' or 'quit' to end.")
+    print(f" Checkpoint: {args.checkpoint}")
+    print(f" Device:     {device.upper()} | Temp: {args.temperature} | Rep Penalty: {args.repetition_penalty}")
+    print(" Commands:   'clear' to reset dialogue, 'exit' or 'quit' to end.")
     print("=" * 65)
 
-    tokenizer = PretrainedTiktokenTokenizer()
+    tokenizer = get_tokenizer("tiktoken")
     model, cfg = load_model(args.checkpoint, device)
 
     messages: List[Dict[str, str]] = []
