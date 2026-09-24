@@ -1,195 +1,180 @@
 """
-data/prepare_dpo.py: Local-caching pairwise preference ingestion engine.
-
-Downloads preference datasets (default: allenai/llama-3.1-tulu-3-8b-preference-mixture)
-locally via HF Hub, samples uniformly across shards to guarantee multi-domain coverage,
-filters identical and length-exploited pairs, and writes normalized JSONL.
+data/prepare_dpo.py: Preference Pair Harvester & Normalizer for DPO.
+Normalizes conversational lists and QA pairs, filters identical answers
+and verbosity exploits, and persists preference pairs to JSONL.
+Supports both key=value CLI invocations and standard flag arguments.
 """
 
-import argparse
 import json
-import math
 import os
 from pathlib import Path
-import random
 import sys
 from typing import Any, Dict, List, Optional
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from dotenv import load_dotenv
-load_dotenv()
-
-from huggingface_hub import HfApi, hf_hub_download
-import pyarrow.parquet as pq
-from tqdm import tqdm
-
-random.seed(42)
+# Ensure repository root is on sys.path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 
-def _extract_turn_text(val: Any) -> str:
-    """Extracts raw text from either a string or a list of message dicts."""
-    if isinstance(val, str):
-        return val.strip()
-    if isinstance(val, list):
-        turns = []
-        for turn in val:
-            if isinstance(turn, dict):
-                content = turn.get("content", "")
-                turns.append(str(content).strip())
-            else:
-                turns.append(str(turn).strip())
-        return "\n".join(turns).strip()
-    return str(val).strip()
+def normalize_preference_record(sample: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Normalizes raw preference data into canonical {system, prompt, chosen, rejected}.
 
+    Returns None if:
+      - Formats cannot be extracted.
+      - Chosen and rejected are identical.
+      - Length exceeds the 350-word verbosity threshold or extreme length disparity.
+    """
+    system_text = sample.get("system", "")
+    prompt_text = ""
+    chosen_text = ""
+    rejected_text = ""
 
-def normalize_preference_record(record: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """Standardizes records into raw prompt/chosen/rejected text."""
-    prompt = record.get("prompt", "")
-    chosen = record.get("chosen", "")
-    rejected = record.get("rejected", "")
-    system = record.get("system", "")
+    # 1. Conversational format: list of role/content dicts
+    if isinstance(sample.get("chosen"), list) and isinstance(sample.get("rejected"), list):
+        chosen_list = sample["chosen"]
+        rejected_list = sample["rejected"]
 
-    # Multi-turn conversation format
-    if isinstance(chosen, list) and len(chosen) > 0 and isinstance(chosen[0], dict):
-        if not prompt and len(chosen) >= 2:
-            prompt_turns = [t.get("content", "") for t in chosen[:-1] if t.get("role") != "system"]
-            sys_turns = [t.get("content", "") for t in chosen[:-1] if t.get("role") == "system"]
-            if sys_turns and not system:
-                system = "\n".join(sys_turns)
-            prompt = "\n".join(prompt_turns)
-            chosen = chosen[-1].get("content", "")
-        elif len(chosen) == 1:
-            chosen = chosen[0].get("content", "")
-        else:
-            chosen = _extract_turn_text(chosen)
+        # Extract system prompt if present
+        for msg in chosen_list:
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                system_text = msg.get("content", "").strip()
+                break
 
-    if isinstance(rejected, list) and len(rejected) > 0 and isinstance(rejected[0], dict):
-        if len(rejected) >= 2 and not prompt:
-            rejected = rejected[-1].get("content", "")
-        elif len(rejected) == 1:
-            rejected = rejected[0].get("content", "")
-        else:
-            rejected = _extract_turn_text(rejected)
+        # Extract user prompt (last user turn)
+        for msg in reversed(chosen_list):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                prompt_text = msg.get("content", "").strip()
+                break
 
-    prompt_str = _extract_turn_text(prompt)
-    chosen_str = _extract_turn_text(chosen)
-    rejected_str = _extract_turn_text(rejected)
-    system_str = _extract_turn_text(system) if system else ""
+        # Extract assistant responses
+        if chosen_list and isinstance(chosen_list[-1], dict) and chosen_list[-1].get("role") == "assistant":
+            chosen_text = chosen_list[-1].get("content", "").strip()
+        if rejected_list and isinstance(rejected_list[-1], dict) and rejected_list[-1].get("role") == "assistant":
+            rejected_text = rejected_list[-1].get("content", "").strip()
 
-    if not prompt_str or not chosen_str or not rejected_str:
+    # 2. Flat QA format
+    else:
+        prompt_text = str(sample.get("prompt", "") or sample.get("question", "")).strip()
+        chosen_text = str(sample.get("chosen", "")).strip()
+        rejected_text = str(sample.get("rejected", "")).strip()
+
+    # Integrity gates
+    if not prompt_text or not chosen_text or not rejected_text:
         return None
 
     # Filter identical completions
-    if chosen_str == rejected_str:
+    if chosen_text == rejected_text:
         return None
 
-    # Guardrail against verbosity reward hacking
-    len_c = len(chosen_str.split())
-    len_r = len(rejected_str.split())
-    if len_c > 2.2 * max(len_r, 1) and len_c > 350:
+    # Filter verbosity hacks & length exploits (>350 words or extreme length imbalance)
+    chosen_words = len(chosen_text.split())
+    rejected_words = len(rejected_text.split())
+
+    if chosen_words > 350 or rejected_words > 350:
         return None
 
-    out = {
-        "prompt": prompt_str,
-        "chosen": chosen_str,
-        "rejected": rejected_str,
+    max_len = max(chosen_words, rejected_words)
+    min_len = max(1, min(chosen_words, rejected_words))
+    if (max_len / min_len > 8.0) and (max_len > 100):
+        return None
+
+    record = {
+        "prompt": prompt_text,
+        "chosen": chosen_text,
+        "rejected": rejected_text,
     }
-    if system_str:
-        out["system"] = system_str
-    return out
+    if system_text:
+        record["system"] = system_text
 
-
-def resolve_shards(repo_id: str, subset: Optional[str], token: Optional[str]) -> List[str]:
-    api = HfApi(token=token)
-    try:
-        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
-        parquets = [f for f in files if f.endswith(".parquet")]
-        if subset:
-            parquets = [f for f in parquets if subset in f]
-        return sorted(parquets)
-    except Exception as e:
-        print(f"[Error] Failed to resolve shards in '{repo_id}': {e}")
-        return []
+    return record
 
 
 def prepare_dpo_dataset(
-    dataset_name: str = "allenai/llama-3.1-tulu-3-8b-preference-mixture",
     output_path: str = "data/dpo/preference_pairs.jsonl",
-    subset: Optional[str] = None,
-    max_samples: int = 7000,
+    dataset_name: str = "argilla/dpo-mix-7k",
+    total_samples: int = 7_000,
 ):
-    out_file = Path(output_path)
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    """Harvests and normalizes preference pairs from Hugging Face or local cache."""
+    print("=" * 70)
+    print("      slm-gpt DPO Preference Pair Assembler (Offline Engine)       ")
+    print("=" * 70)
+    print(f"Target Budget: {total_samples:,} pairs")
+    print(f"Source:        {dataset_name}")
+    print(f"Output:        {output_path}")
 
-    print(f"[DPO Loader] Source: {dataset_name} | Target: {max_samples:,} pairs")
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-    local_source = Path(dataset_name)
-    if local_source.exists():
-        shards = sorted([str(p) for p in local_source.glob("*.parquet")]) if local_source.is_dir() else [str(local_source)]
-        is_local = True
-    else:
-        shards = resolve_shards(dataset_name, subset, token)
-        is_local = False
+    from datasets import load_dataset
 
-    if not shards:
-        raise FileNotFoundError(f"No parquet shards found for '{dataset_name}'.")
+    print(f"Loading '{dataset_name}' from cache/Hub...")
+    ds = load_dataset(dataset_name, split="train")
 
-    quota_per_shard = max(1, math.ceil(max_samples / len(shards)))
-    collected_pairs: List[Dict[str, str]] = []
+    valid_records: List[Dict[str, str]] = []
+    skipped = 0
 
-    for i, shard in enumerate(shards):
-        if is_local:
-            local_path = shard
-        else:
-            print(f"[{i + 1}/{len(shards)}] Downloading remote shard: {shard}")
-            local_path = hf_hub_download(
-                repo_id=dataset_name,
-                filename=shard,
-                repo_type="dataset",
-                token=token,
-            )
-
-        shard_pairs = []
-        pf = pq.ParquetFile(local_path)
-        for batch in pf.iter_batches(batch_size=256):
-            for row in batch.to_pylist():
-                norm = normalize_preference_record(row)
-                if norm:
-                    shard_pairs.append(norm)
-                if len(shard_pairs) >= quota_per_shard:
-                    break
-            if len(shard_pairs) >= quota_per_shard:
+    for row in ds:
+        norm = normalize_preference_record(row)
+        if norm is not None:
+            valid_records.append(norm)
+            if len(valid_records) >= total_samples:
                 break
+        else:
+            skipped += 1
 
-        collected_pairs.extend(shard_pairs)
-        print(f"  ✓ Harvested {len(shard_pairs):,} pairs from shard {i + 1} (Total: {len(collected_pairs):,})")
-        if len(collected_pairs) >= max_samples:
-            break
+    with open(output_path, "w", encoding="utf-8") as f:
+        for rec in valid_records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    random.shuffle(collected_pairs)
-    final_pairs = collected_pairs[:max_samples]
+    print("\n" + "=" * 70)
+    print("✓ Successfully assembled DPO preference dataset:")
+    print(f"  Path:       {output_path}")
+    print(f"  Kept:       {len(valid_records):,} pairs")
+    print(f"  Filtered:   {skipped:,} pairs (identical / length exploit)")
+    print("=" * 70)
 
-    with open(out_file, "w", encoding="utf-8") as f_out:
-        for item in final_pairs:
-            f_out.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    file_size_mb = os.path.getsize(out_file) / (1024 * 1024)
-    print(f"\n✓ DPO Preparation Complete: {output_path} ({len(final_pairs):,} pairs, {file_size_mb:.2f} MB)")
+def parse_cli_args() -> Dict[str, Any]:
+    """Flexible CLI parser supporting both key=value and standard flag arguments."""
+    kwargs: Dict[str, Any] = {
+        "output_path": "data/dpo/preference_pairs.jsonl",
+        "dataset_name": "argilla/dpo-mix-7k",
+        "total_samples": 7_000,
+    }
+
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if "=" in arg:
+            k, v = arg.split("=", 1)
+            k = k.lstrip("-")
+            if k in ("total_samples", "max_samples", "budget"):
+                kwargs["total_samples"] = int(v)
+            elif k in ("output_path", "output_file"):
+                kwargs["output_path"] = v
+            elif k in ("dataset_name", "source"):
+                kwargs["dataset_name"] = v
+        elif arg in ("--output_path", "-o"):
+            i += 1
+            if i < len(args):
+                kwargs["output_path"] = args[i]
+        elif arg in ("--total_samples", "--max_samples", "-n"):
+            i += 1
+            if i < len(args):
+                kwargs["total_samples"] = int(args[i])
+        elif arg in ("--dataset_name", "-d"):
+            i += 1
+            if i < len(args):
+                kwargs["dataset_name"] = args[i]
+        elif arg.isdigit():
+            kwargs["total_samples"] = int(arg)
+        i += 1
+
+    return kwargs
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download and prepare pairwise DPO preferences.")
-    parser.add_argument("--dataset_name", type=str, default="allenai/llama-3.1-tulu-3-8b-preference-mixture")
-    parser.add_argument("--output_path", type=str, default="data/dpo/preference_pairs.jsonl")
-    parser.add_argument("--subset", type=str, default=None)
-    parser.add_argument("--max_samples", type=int, default=7000)
-
-    args = parser.parse_args()
-    prepare_dpo_dataset(
-        dataset_name=args.dataset_name,
-        output_path=args.output_path,
-        subset=args.subset,
-        max_samples=args.max_samples,
-    )
+    cli_kwargs = parse_cli_args()
+    prepare_dpo_dataset(**cli_kwargs)
