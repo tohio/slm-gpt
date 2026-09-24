@@ -308,7 +308,7 @@ class PipelineOrchestrator:
         print("=" * 70)
         print(f"Model Size Target:      {self.cfg.size} (Tag: {self.size_tag})")
         print(f"Hardware Profile:       {self.hw_profile.device_name} ({self.hw_profile.arch_generation})")
-        print(f"Pre-training Compute:   Multi-GPU ({self.num_gpus} GPUs via torchrun)")
+        print(f"Pre-training Compute:   {'Multi-GPU' if num_gpus > 1 else 'Single-GPU'} ({num_gpus} GPU{'s' if num_gpus > 1 else ''} via torchrun)")
         print(f"Alignment Compute:      Single-GPU (SFT & DPO)")
         print("=" * 70)
 

@@ -225,12 +225,14 @@ def main():
         device = f"cuda:{ddp_local_rank}"
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0
+        mode_str = f"Multi-GPU DDP ({ddp_world_size} GPUs)" if ddp_world_size > 1 else "Single-GPU (torchrun)"
     else:
         ddp_rank = 0
         ddp_local_rank = 0
         ddp_world_size = 1
         master_process = True
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        mode_str = "Single-GPU (Local)"
 
     device_type = "cuda" if "cuda" in device else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
@@ -294,7 +296,7 @@ def main():
         print(f"Target Size Tag:        {args.size} -> Resolved: {size_tag} ({runtime_cfg.actual_params:,} params)")
         print(f"Data Directory:         {args.data_dir}")
         print(f"Output Directory:       {out_dir}")
-        print(f"Mode:                   {'Multi-GPU DDP' if ddp else 'Single-GPU / Local DDP'}")
+        print(f"Mode:                   {mode_str}")
         print(f"Cluster World Size:     {ddp_world_size} (Local Rank: {ddp_local_rank})")
         print(f"Device & Precision:     {device} | {'bfloat16' if dtype == torch.bfloat16 else 'float16'}")
         print(f"Sequence Length (T):    {T}")
