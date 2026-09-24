@@ -5,7 +5,7 @@ pipeline/test/test_pipeline.py: End-to-end integration and health-gate tests.
 from pathlib import Path
 import pytest
 
-from pipeline.orchestrator import PipelineConfig, PipelineOrchestrator
+from pipeline.run import PipelineConfig, PipelineOrchestrator
 
 
 @pytest.mark.parametrize("size", ["125M", "350M"])
@@ -21,4 +21,4 @@ def test_health_gate_verification(size: str):
     orch = PipelineOrchestrator(cfg)
 
     fake_ckpt = Path("checkpoints/non_existent_stage/model.pt")
-    assert orch.verify_health_gate(fake_ckpt) is False
+    assert orch.verify_checkpoint_health(str(fake_ckpt)) is False
