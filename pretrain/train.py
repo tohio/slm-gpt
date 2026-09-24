@@ -238,9 +238,17 @@ def main():
     out_dir = args.output_dir or f"checkpoints/pretrain_{size_tag}"
     os.makedirs(out_dir, exist_ok=True)
 
+    # Resolve architectural fields defensively across schema variants
+    n_layers = getattr(model_cfg, "n_layers", getattr(model_cfg, "n_layer", "N/A"))
+    d_model = getattr(model_cfg, "d_model", getattr(model_cfg, "n_embd", "N/A"))
+    n_heads = getattr(model_cfg, "n_heads", getattr(model_cfg, "n_head", "N/A"))
+    n_kv_heads = getattr(model_cfg, "n_kv_heads", getattr(model_cfg, "n_kv_head", n_heads))
+    d_ffn = getattr(model_cfg, "d_ffn", getattr(model_cfg, "n_inner", "N/A"))
+    max_seq_len = getattr(model_cfg, "max_seq_len", getattr(model_cfg, "block_size", 2048))
+
     # 3. Micro-batch & Gradient Accumulation Geometry
     B = args.micro_batch_size
-    T = model_cfg.max_seq_len
+    T = max_seq_len
     target_tokens_per_step = max(args.global_batch_size * T, B * T * ddp_world_size)
     grad_accum_steps = max(1, target_tokens_per_step // (B * T * ddp_world_size))
     batch_tokens_per_step = B * T * grad_accum_steps * ddp_world_size
@@ -283,7 +291,7 @@ def main():
         print(f"Micro-batch / GPU:      {B} | Global Batch Target: {args.global_batch_size}")
         print(f"Grad Accumulation:      {grad_accum_steps} micro-steps")
         print(f"Learning Rate:          Peak: {args.learning_rate:.2e} -> Min: {args.min_learning_rate:.2e} (Warmup: {args.warmup_steps})")
-        print(f"Architecture:           Layers={model_cfg.n_layer}, d_model={model_cfg.n_embd}, GQA={model_cfg.n_head}:{model_cfg.n_kv_head}, d_ffn={model_cfg.n_inner}")
+        print(f"Architecture:           Layers={n_layers}, d_model={d_model}, GQA={n_heads}:{n_kv_heads}, d_ffn={d_ffn}")
         print("-" * 65)
 
     # 6. Model Initialization
