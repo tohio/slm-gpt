@@ -143,20 +143,27 @@ def parse_args():
     parser.add_argument("--save_interval", type=int, default=500)
     args = parser.parse_args()
 
+    INT_FIELDS = {
+        "micro_batch_size", "global_batch_size", "max_steps",
+        "warmup_steps", "eval_interval", "eval_iters", "save_interval"
+    }
+    FLOAT_FIELDS = {"learning_rate", "min_learning_rate", "weight_decay"}
+
     for item in args.kv_args:
         if "=" in item:
             k, v = item.split("=", 1)
             k = k.lstrip("-")
             if hasattr(args, k):
-                cur_type = type(getattr(args, k))
-                if cur_type == bool:
-                    setattr(args, k, v.lower() in ("true", "1", "yes"))
-                elif cur_type == int:
-                    setattr(args, k, int(v))
-                elif cur_type == float:
+                if k in INT_FIELDS:
+                    setattr(args, k, int(v) if v.lower() != "none" else None)
+                elif k in FLOAT_FIELDS:
                     setattr(args, k, float(v))
                 else:
-                    setattr(args, k, v)
+                    cur_val = getattr(args, k)
+                    if isinstance(cur_val, bool):
+                        setattr(args, k, v.lower() in ("true", "1", "yes"))
+                    else:
+                        setattr(args, k, v)
     return args
 
 
@@ -247,9 +254,9 @@ def main():
     max_seq_len = getattr(model_cfg, "max_seq_len", getattr(model_cfg, "block_size", 2048))
 
     # 3. Micro-batch & Gradient Accumulation Geometry
-    B = args.micro_batch_size
-    T = max_seq_len
-    target_tokens_per_step = max(args.global_batch_size * T, B * T * ddp_world_size)
+    B = int(args.micro_batch_size)
+    T = int(max_seq_len)
+    target_tokens_per_step = max(int(args.global_batch_size) * T, B * T * ddp_world_size)
     grad_accum_steps = max(1, target_tokens_per_step // (B * T * ddp_world_size))
     batch_tokens_per_step = B * T * grad_accum_steps * ddp_world_size
 
@@ -274,7 +281,7 @@ def main():
     )
 
     total_tokens = train_loader.total_tokens()
-    max_steps = args.max_steps if args.max_steps is not None else max(1, total_tokens // batch_tokens_per_step)
+    max_steps = int(args.max_steps) if args.max_steps is not None else max(1, total_tokens // batch_tokens_per_step)
 
     # 5. Master Node Banner
     if master_process:
@@ -311,7 +318,7 @@ def main():
         print(f"Verified Model Storage: {total_params:,} parameters ({total_params/1e6:.2f}M)")
         print(f"Total Dataset Tokens:   {total_tokens:,} ({total_tokens/1e9:.2f}B)")
         print(f"Batch Tokens / Step:    {batch_tokens_per_step:,} (Micro: {B}, Accum: {grad_accum_steps})")
-        print(f"Total Optimizer Steps:  {max_steps:,} (Warmup: {args.warmup_steps})")
+        print(f"Total Optimizer Steps:  {int(max_steps):,} (Warmup: {args.warmup_steps})")
 
     # 7. Optimizer Setup
     if hasattr(raw_model, "configure_optimizers"):
@@ -382,7 +389,7 @@ def main():
 
     for step in range(max_steps):
         t0 = time.time()
-        lr = get_lr(step, args.warmup_steps, max_steps, args.learning_rate, args.min_learning_rate)
+        lr = get_lr(step, int(args.warmup_steps), max_steps, args.learning_rate, args.min_learning_rate)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -433,7 +440,7 @@ def main():
 
         # Periodic Evaluation and Checkpointing
         is_last_step = (step == max_steps - 1)
-        if (step > 0 and step % args.eval_interval == 0) or is_last_step:
+        if (step > 0 and step % int(args.eval_interval) == 0) or is_last_step:
             val_loss = estimate_loss(model, val_loader, dtype=dtype, eval_iters=args.eval_iters)
             if master_process:
                 print(f"✓ Validation at step {step + 1}: loss {val_loss:.4f}")
