@@ -1,7 +1,7 @@
 """
-data/prepare_packed_curriculum.py: Physical Token Interleaving.
-Streams and packs the multi-source curriculum into fixed-size .bin shards.
-Uses Token-Deficit Scheduling to guarantee exact curriculum distribution.
+data/prepare_packed_curriculum.py: Physical Token Interleaving (Option 2: Direct Parquet Cache).
+Downloads a single parquet chunk per dataset locally to avoid PyArrow HTTP stream deadlocks,
+then packs tokens into standardized uint16 .bin shards.
 """
 
 import glob
@@ -16,14 +16,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dotenv import load_dotenv
 load_dotenv()
 
-from datasets import load_dataset
+from huggingface_hub import HfApi, hf_hub_download
 import numpy as np
+import pyarrow.parquet as pq
 
 from tokenizer.factory import get_tokenizer
 
 
 class SourceReader:
-    """Iterates documents as token arrays from either local .bin shards or Hugging Face streams."""
+    """Base reader interface for curriculum sources."""
     def __init__(self, name: str, weight: float):
         self.name = name
         self.weight = weight
@@ -33,8 +34,8 @@ class SourceReader:
         raise NotImplementedError
 
 
-class HFStreamReader(SourceReader):
-    """Streams and tokenizes raw documents in buffered chunks from Hugging Face."""
+class FastParquetReader(SourceReader):
+    """Downloads one parquet file locally via HF Hub and reads batches via PyArrow."""
     def __init__(
         self,
         name: str,
@@ -42,55 +43,84 @@ class HFStreamReader(SourceReader):
         subset: Optional[str],
         text_key: str,
         weight: float,
-        split: str = "train",
-        doc_buffer_size: int = 128,
     ):
         super().__init__(name, weight)
         self.repo = repo
         self.subset = subset
         self.text_key = text_key
-        self.split = split
-        self.doc_buffer_size = doc_buffer_size
+        self._local_path: Optional[str] = None
+
+    def _resolve_target_file(self, token: Optional[str]) -> Optional[str]:
+        api = HfApi(token=token)
+        try:
+            files = api.list_repo_files(repo_id=self.repo, repo_type="dataset")
+            parquet_files = [f for f in files if f.endswith(".parquet")]
+            if not parquet_files:
+                return None
+
+            if self.subset:
+                subset_matches = [f for f in parquet_files if self.subset in f]
+                if subset_matches:
+                    return subset_matches[0]
+
+            return parquet_files[0]
+        except Exception as e:
+            print(f"[{self.name}] Error checking files in {self.repo}: {e}")
+            return None
+
+    def _ensure_local_file(self) -> Optional[str]:
+        if self._local_path and os.path.exists(self._local_path):
+            return self._local_path
+
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        auth_str = " (authenticated)" if token else " (unauthenticated)"
+        print(f"[{self.name}] Finding data shard in {self.repo}{auth_str}...")
+
+        target_file = self._resolve_target_file(token)
+        if not target_file:
+            print(f"[{self.name}] No parquet files found in repository.")
+            return None
+
+        print(f"[{self.name}] Downloading shard: {target_file}")
+        self._local_path = hf_hub_download(
+            repo_id=self.repo,
+            filename=target_file,
+            repo_type="dataset",
+            token=token,
+        )
+        print(f"[{self.name}] Cached locally: {os.path.basename(self._local_path)} ({os.path.getsize(self._local_path) / (1024 * 1024):.1f} MB)")
+        return self._local_path
 
     def stream_docs(self, tokenizer) -> Iterator[List[int]]:
-        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        if not self._logged:
-            sub_str = f" ({self.subset})" if self.subset else ""
-            auth_str = " (authenticated)" if hf_token else " (unauthenticated)"
-            print(f"[{self.name}] Connecting to stream: {self.repo}{sub_str}{auth_str}...")
-            self._logged = True
+        local_path = self._ensure_local_file()
+        if not local_path:
+            print(f"[{self.name}] Fallback: generating synthetic curriculum docs.")
+            for i in range(5000):
+                yield tokenizer.encode(f"Synthetic document content for {self.name} sample {i}.")
+            return
 
         try:
-            kwargs = {"split": self.split, "streaming": True, "token": hf_token}
-            if self.subset:
-                ds = load_dataset(self.repo, self.subset, **kwargs)
-            else:
-                ds = load_dataset(self.repo, **kwargs)
+            pf = pq.ParquetFile(local_path)
+            schema_cols = pf.schema_arrow.names
 
-            batch_texts = []
-            for item in ds:
-                text = (
-                    item.get(self.text_key)
-                    or item.get("text")
-                    or item.get("content")
-                    or ""
-                )
-                if text and len(text.strip()) > 0:
-                    batch_texts.append(text)
+            col_to_use = self.text_key if self.text_key in schema_cols else None
+            if not col_to_use:
+                for candidate in ["text", "content", "prompt"]:
+                    if candidate in schema_cols:
+                        col_to_use = candidate
+                        break
+            if not col_to_use:
+                col_to_use = schema_cols[0]
 
-                if len(batch_texts) >= self.doc_buffer_size:
-                    for t in batch_texts:
-                        yield tokenizer.encode(t)
-                    batch_texts.clear()
-
-            for t in batch_texts:
-                yield tokenizer.encode(t)
+            for batch in pf.iter_batches(batch_size=256, columns=[col_to_use]):
+                for text_val in batch[col_to_use].to_pylist():
+                    if text_val and isinstance(text_val, str) and len(text_val.strip()) > 0:
+                        yield tokenizer.encode(text_val)
 
         except Exception as e:
-            if not self._logged:
-                print(f"[{self.name}] Error connecting to {self.repo}: {e}")
-            for i in range(1000):
-                yield tokenizer.encode(f"Synthetic document content for {self.name} sample {i}.")
+            print(f"[{self.name}] Error reading parquet file: {e}")
+            for i in range(5000):
+                yield tokenizer.encode(f"Fallback synthetic document for {self.name} sample {i}.")
 
 
 class LocalBinReader(SourceReader):
@@ -104,13 +134,7 @@ class LocalBinReader(SourceReader):
     def stream_docs(self, tokenizer) -> Iterator[List[int]]:
         shard_files = sorted(glob.glob(os.path.join(self.directory, "*.bin")))
         if not shard_files:
-            if not self._logged:
-                print(f"[{self.name}] Warning: No .bin shards found in '{self.directory}'")
             return
-
-        if not self._logged:
-            print(f"[{self.name}] Ingesting pre-tokenized shards from: {self.directory}")
-            self._logged = True
 
         for sf in shard_files:
             tokens = np.fromfile(sf, dtype=self.dtype)
@@ -142,7 +166,6 @@ def pack_curriculum_to_shards(
     tokenizer = get_tokenizer(tokenizer_type, tokenizer_path)
     eot_id = tokenizer.eot_id
 
-    # Dynamically scale validation tokens: 5% of total budget (min 10k, max 500k)
     if val_tokens is None:
         val_tokens = max(10_000, min(500_000, total_token_budget // 20))
 
@@ -151,7 +174,7 @@ def pack_curriculum_to_shards(
     target_proportions = [w / total_weight for w in raw_weights]
 
     print("=" * 70)
-    print("      slm-gpt Physical Token Packing Engine (Standardized)")
+    print("      slm-gpt Physical Token Packing Engine (Local Parquet Cache)")
     print("=" * 70)
     print(f"Total Train Target:  {total_token_budget:,} tokens")
     print(f"Validation Target:   {val_tokens:,} tokens")
@@ -166,10 +189,11 @@ def pack_curriculum_to_shards(
     tokens_per_source = [0] * len(sources)
 
     # 1. Harvest validation partition first
-    print("Extracting validation partition...")
+    print("\nExtracting validation partition...")
     val_buffer: List[int] = []
     source_idx = 0
     last_val_log = 0
+
     while len(val_buffer) < val_tokens:
         try:
             doc = next(generators[source_idx % len(sources)])
@@ -187,10 +211,10 @@ def pack_curriculum_to_shards(
     val_data = np.array(val_buffer[:val_tokens], dtype=np.uint16)
     val_file = os.path.join(output_dir, "val_00000.bin")
     val_data.tofile(val_file)
-    print(f"✓ Wrote validation shard: {val_file} ({len(val_data):,} tokens)")
+    print(f"✓ Wrote validation shard: {val_file} ({len(val_data):,} tokens, {os.path.getsize(val_file)/1024:.1f} KB)")
 
     # 2. Pack Training Shards
-    print("Packing training partition...")
+    print("\nPacking training partition...")
     token_buffer: List[int] = []
     shard_idx = 0
     total_tokens_written = 0
@@ -220,7 +244,7 @@ def pack_curriculum_to_shards(
         total_current = total_tokens_written + len(token_buffer)
         if total_current - last_train_log >= max(20_000, total_token_budget // 10):
             pct = (total_current / total_token_budget) * 100
-            print(f"  [Training] Streamed {total_current:,} / {total_token_budget:,} tokens ({pct:.1f}%)")
+            print(f"  [Training] Packed {total_current:,} / {total_token_budget:,} tokens ({pct:.1f}%)")
             last_train_log = total_current
 
         while len(token_buffer) >= shard_size_tokens:
@@ -243,7 +267,7 @@ def pack_curriculum_to_shards(
         out_file = os.path.join(output_dir, f"train_{shard_idx:05d}.bin")
         shard_data.tofile(out_file)
         total_tokens_written += len(shard_data)
-        print(f"✓ Wrote final remainder shard: {out_file} | Total: {total_tokens_written:,} tokens")
+        print(f"✓ Wrote final remainder shard: {out_file} | Total: {total_tokens_written:,} tokens ({os.path.getsize(out_file)/(1024*1024):.2f} MB)")
 
     print("=" * 70)
     print(f"Physical packing complete. Total train tokens: {total_tokens_written:,}")
@@ -254,15 +278,15 @@ def build_default_curriculum(upstream_dir: Optional[str] = None) -> List[SourceR
     if upstream_dir and os.path.exists(upstream_dir):
         return [
             LocalBinReader("Local Curated Shards", upstream_dir, weight=0.98, eot_token_id=50256, dtype=np.uint16),
-            HFStreamReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=0.02),
+            FastParquetReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=0.02),
         ]
 
     return [
-        HFStreamReader("FineWeb-Edu", "HuggingFaceFW/fineweb-edu", "sample-10BT", "text", weight=0.48),
-        HFStreamReader("Cosmopedia v2", "HuggingFaceTB/cosmopedia-v2", "default", "text", weight=0.20),
-        HFStreamReader("The Stack-Edu", "HuggingFaceTB/smollm-corpus", "python-edu", "content", weight=0.15),
-        HFStreamReader("FineMath", "HuggingFaceTB/finemath", "finemath-4+", "text", weight=0.15),
-        HFStreamReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=0.02),
+        FastParquetReader("FineWeb-Edu", "HuggingFaceFW/fineweb-edu", "sample-10BT", "text", weight=0.48),
+        FastParquetReader("Cosmopedia v2", "HuggingFaceTB/cosmopedia-v2", "default", "text", weight=0.20),
+        FastParquetReader("The Stack-Edu", "HuggingFaceTB/smollm-corpus", "python-edu", "content", weight=0.15),
+        FastParquetReader("FineMath", "HuggingFaceTB/finemath", "finemath-4+", "text", weight=0.15),
+        FastParquetReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=0.02),
     ]
 
 
