@@ -1,11 +1,11 @@
 """
 scaling/profiler.py: Architecture-Aware Environment Bootstrapper & Profiler.
 Supports:
-  1. NVIDIA Blackwell (B100/B200/GB200, SM 10.x/12.x) -> FA4 / FA3 / FA2
-  2. NVIDIA Hopper (H100/H200, SM 9.0)                -> FA4 / FA3 / FA2
-  3. NVIDIA Ampere & Ada (A100/RTX 3090/4090, SM 8.x) -> FA2
-  4. Apple Silicon (M1/M2/M3/M4 via MPS)              -> Native PyTorch SDPA
-  5. CPU (x86_64, ARM64)                              -> Native PyTorch SDPA
+  1. NVIDIA Blackwell (B100/B200/GB200) -> FA4 -> FA2 -> Native SDPA
+  2. NVIDIA Hopper (H100/H200)          -> FA4 -> FA2 -> Native SDPA
+  3. NVIDIA Ampere & Ada (A100/RTX)     -> FA2 -> Native SDPA
+  4. Apple Silicon (MPS)                -> Native SDPA
+  5. CPU (x86_64, ARM64)                -> Native SDPA
 """
 
 import importlib.util
@@ -23,6 +23,7 @@ BASE_DEPENDENCIES: List[str] = [
     "python-dotenv>=1.0.0",
     "packaging>=23.0",
     "ninja>=1.11.0",
+    "psutil",
     "wandb",
     "numpy>=1.26.0",
     "tiktoken>=0.7.0",
@@ -45,7 +46,7 @@ class HardwareProfile:
         precision_str: str,
         wheel_index_url: Optional[str],
         recommended_packages: List[str],
-        fa_candidates: List[Tuple[str, str]],
+        fa_candidates: List[Tuple[str, List[str]]],
     ):
         self.device_type = device_type
         self.device_name = device_name
@@ -62,9 +63,6 @@ class HardwareProfile:
 class HardwareProfiler:
     @staticmethod
     def profile() -> HardwareProfile:
-        # =================================================================
-        # 1. NVIDIA CUDA PLATFORMS (A100 and up: SM 8.0 -> SM 12.0)
-        # =================================================================
         if torch.cuda.is_available():
             dev_idx = torch.cuda.current_device()
             dev_name = torch.cuda.get_device_name(dev_idx)
@@ -76,7 +74,7 @@ class HardwareProfiler:
             cuda_version = torch.version.cuda or ""
             major_cuda = int(cuda_version.split(".")[0]) if "." in cuda_version else 12
 
-            # Tier 1: NVIDIA Blackwell (SM 10.x / 12.x) & Hopper (SM 9.0)
+            # --- A. Hopper (SM 9.0) & Blackwell (SM 10.x+) ---
             if sm_major >= 9:
                 arch = f"NVIDIA Blackwell ({dev_name})" if sm_major >= 10 else f"NVIDIA Hopper ({dev_name})"
                 wheel_url = "https://download.pytorch.org/whl/cu130" if major_cuda >= 13 else "https://download.pytorch.org/whl/cu126"
@@ -92,13 +90,12 @@ class HardwareProfiler:
                     wheel_index_url=wheel_url,
                     recommended_packages=BASE_DEPENDENCIES + ["torch>=2.5.0", "triton>=3.1.0"],
                     fa_candidates=[
-                        ("flash_attn_4", "flash-attn-4"),
-                        ("flash_attn_interface", "flash-attn-3"),
-                        ("flash_attn", "flash-attn>=2.6.0"),
+                        ("flash_attn.cute", ["install", "--pre", "flash-attn-4", "--no-build-isolation"]),
+                        ("flash_attn", ["install", "flash-attn>=2.6.0", "--no-build-isolation"]),
                     ],
                 )
 
-            # Tier 2: NVIDIA Ampere (A100) & Ada Lovelace (SM 8.0 - 8.9)
+            # --- B. Ampere & Ada (A100, RTX 3090/4090 - SM 8.0 to 8.9) ---
             elif sm_major == 8:
                 arch = f"NVIDIA Ampere/Ada ({dev_name})"
                 wheel_url = "https://download.pytorch.org/whl/cu124"
@@ -114,11 +111,11 @@ class HardwareProfiler:
                     wheel_index_url=wheel_url,
                     recommended_packages=BASE_DEPENDENCIES + ["torch>=2.4.0", "triton>=3.0.0"],
                     fa_candidates=[
-                        ("flash_attn", "flash-attn>=2.6.0"),
+                        ("flash_attn", ["install", "flash-attn>=2.6.0", "--no-build-isolation"]),
                     ],
                 )
 
-            # Fallback for older CUDA devices (< SM 8.0)
+            # --- C. Older CUDA Architectures (< SM 8.0) ---
             else:
                 return HardwareProfile(
                     device_type="cuda",
@@ -133,26 +130,22 @@ class HardwareProfiler:
                     fa_candidates=[],
                 )
 
-        # =================================================================
-        # 2. APPLE SILICON PLATFORMS (M1, M2, M3, M4 via MPS)
-        # =================================================================
+        # --- D. Apple Silicon (MPS) ---
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return HardwareProfile(
                 device_type="mps",
                 device_name=f"Apple Silicon ({platform.processor() or 'ARM'})",
                 arch_generation="Apple Metal (MPS)",
-                total_memory_gb=16.0,  # Unified memory baseline
+                total_memory_gb=16.0,
                 compute_capability=None,
                 precision=torch.float32,
                 precision_str="float32",
                 wheel_index_url=None,
                 recommended_packages=BASE_DEPENDENCIES + ["torch>=2.4.0"],
-                fa_candidates=[],  # Handled natively by Apple Metal SDPA
+                fa_candidates=[],
             )
 
-        # =================================================================
-        # 3. CPU PLATFORMS (x86_64, ARM64)
-        # =================================================================
+        # --- E. CPU Fallback ---
         return HardwareProfile(
             device_type="cpu",
             device_name=platform.processor() or "Generic CPU",
@@ -163,7 +156,7 @@ class HardwareProfiler:
             precision_str="float32",
             wheel_index_url="https://download.pytorch.org/whl/cpu",
             recommended_packages=BASE_DEPENDENCIES + ["torch>=2.4.0"],
-            fa_candidates=[],  # Handled natively by PyTorch C++ Vectorized SDPA
+            fa_candidates=[],
         )
 
     @classmethod
@@ -194,19 +187,13 @@ class HardwareProfiler:
 
     @classmethod
     def auto_install_environment(cls):
-        """
-        Autonomous Multi-Platform Environment Bootstrapper:
-        1. Checks core dependencies (regex, tiktoken, datasets, wandb, etc.).
-        2. Auto-installs missing packages without human intervention.
-        3. Probes hardware-specific FlashAttention candidates (A100+: FA2, Hopper/Blackwell: FA4->FA3->FA2).
-        4. Reverts cleanly to PyTorch Native SDPA on MPS, CPU, or compiler misses.
-        """
         profile = cls.profile()
 
-        # Step 1: Ensure core runtime packages are present
+        # Step 1: Verify core dependencies
         core_checks = {
             "regex": "regex",
             "numpy": "numpy",
+            "psutil": "psutil",
             "tiktoken": "tiktoken",
             "datasets": "datasets",
             "wandb": "wandb",
@@ -225,53 +212,29 @@ class HardwareProfiler:
         if not profile.fa_candidates:
             return
 
-        # Step 3: Check if an FA backend is already active
+        # Step 3: Check if an FA candidate is already installed and importable
         for mod_name, _ in profile.fa_candidates:
-            if importlib.util.find_spec(mod_name) is not None:
-                return
-
-        # Step 4: Multi-tier installation probe for A100 and up
-        for mod_name, pip_pkg in profile.fa_candidates:
-            print(f"[HardwareProfiler] Probing hardware backend candidate: {pip_pkg}...")
-            try:
-                res = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", pip_pkg, "--no-build-isolation"],
-                    capture_output=True,
-                    text=True,
-                    timeout=240,
-                )
-                if res.returncode == 0:
-                    print(f"[HardwareProfiler] ✓ Successfully activated {pip_pkg}.")
+            root_mod = mod_name.split(".")[0]
+            if importlib.util.find_spec(root_mod) is not None:
+                try:
+                    __import__(mod_name)
                     return
+                except Exception:
+                    pass
+
+        # Step 4: Probing candidate backends in priority order
+        for mod_name, pip_args in profile.fa_candidates:
+            pkg_desc = " ".join(pip_args[1:])
+            print(f"[HardwareProfiler] Probing hardware backend candidate: {pkg_desc}...")
+            try:
+                cmd = [sys.executable, "-m", "pip"] + pip_args
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                if res.returncode == 0:
+                    print(f"[HardwareProfiler] ✓ Successfully activated {mod_name}.")
+                    return
+                else:
+                    print(f"[HardwareProfiler] Candidate {pkg_desc} failed. Trying next...")
             except Exception as e:
-                pass
+                print(f"[HardwareProfiler] Build error for {pkg_desc}: {e}")
 
         print("[HardwareProfiler] Notice: Operating under PyTorch-Native-SDPA.")
-
-
-def tune_micro_batch_size(
-    target_params: int,
-    max_seq_len: int,
-    total_memory_gb: float,
-    world_size: int = 1,
-    vocab_size: int = 50304,
-) -> int:
-    """Auto-tunes micro-batch size based on device memory and sequence length."""
-    static_gb = (target_params * 14) / (1024 ** 3) + 2.0
-    usable_vram = max(0.5, (total_memory_gb * 0.75) - static_gb)
-
-    vocab_workspace_bytes = max_seq_len * vocab_size * 10
-    activation_bytes = max_seq_len * 768 * 90
-    per_sample_gb = (vocab_workspace_bytes + activation_bytes) / (1024 ** 3)
-
-    estimated_batch = int(usable_vram / max(per_sample_gb, 0.1))
-
-    powers = [16, 8, 4, 2, 1] if max_seq_len >= 2048 else [32, 16, 8, 4, 2, 1]
-    for p in powers:
-        if estimated_batch >= p:
-            return p
-    return 1
-
-
-if __name__ == "__main__":
-    HardwareProfiler.auto_install_environment()

@@ -1,6 +1,6 @@
 """
 transformer/attention.py: Grouped-Query Attention (GQA) with Dynamic Multi-Backend Dispatch.
-Hierarchical Dispatch: FA4 (CuTeDSL) -> FA3 (Hopper/Blackwell) -> FA2 (Ampere/Ada) -> PyTorch Native SDPA.
+Hierarchical Dispatch: FA4 (CuTeDSL sm90+/sm100) -> FA2 (Ampere/Ada sm80+) -> PyTorch Native SDPA.
 """
 
 from typing import Optional, Tuple
@@ -14,17 +14,15 @@ from .config import ModelConfig
 # Dynamic Hardware Kernel Resolution
 # =====================================================================
 HAS_FA4 = False
-HAS_FA3 = False
 HAS_FA2 = False
 
 FA4_FUNC = None
-FA3_FUNC = None
 FA2_FUNC = None
 
 if torch.cuda.is_available():
     major, _ = torch.cuda.get_device_capability()
 
-    # FlashAttention-4 / FlashAttention-3 target Hopper (sm90) and Blackwell (sm100/sm120)
+    # Tier 1: Hopper (sm90) and Blackwell (sm100/sm120) -> FA4
     if major >= 9:
         try:
             from flash_attn.cute import flash_attn_func as fa4_f
@@ -36,20 +34,10 @@ if torch.cuda.is_available():
                 FA4_FUNC = fa4_f
                 HAS_FA4 = True
             except (ImportError, Exception):
-                try:
-                    from flash_attn_interface import flash_attn_func as fa3_f
-                    FA3_FUNC = fa3_f
-                    HAS_FA3 = True
-                except (ImportError, Exception):
-                    try:
-                        from flash_attn_3 import flash_attn_interface as fa3_mod
-                        FA3_FUNC = fa3_mod.flash_attn_func
-                        HAS_FA3 = True
-                    except (ImportError, Exception):
-                        pass
+                pass
 
-    # FlashAttention-2 fallback for Ampere (sm80), Ada (sm89), or Hopper fallback
-    if not (HAS_FA4 or HAS_FA3) and major >= 8:
+    # Tier 2: Ampere (sm80), Ada (sm89), or Hopper fallback -> FA2
+    if not HAS_FA4 and major >= 8:
         try:
             from flash_attn import flash_attn_func as fa2_f
             FA2_FUNC = fa2_f
@@ -62,9 +50,9 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tuple[to
     """Precompute cosine and sine frequency bands for RoPE across sequence positions."""
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)  # (end, dim // 2)
-    cos = torch.cos(freqs)         # (end, dim // 2)
-    sin = torch.sin(freqs)         # (end, dim // 2)
+    freqs = torch.outer(t, freqs)
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
     return cos, sin
 
 
@@ -76,11 +64,8 @@ def apply_rotary_emb(
 ) -> torch.Tensor:
     """Apply rotary embeddings to tensor x of shape (B, num_heads, T, head_dim)."""
     B, H, T, D = x.size()
-    cos_w = cos[offset : offset + T, :].to(x.device).to(x.dtype)
-    sin_w = sin[offset : offset + T, :].to(x.device).to(x.dtype)
-
-    cos_w = cos_w.unsqueeze(0).unsqueeze(0)
-    sin_w = sin_w.unsqueeze(0).unsqueeze(0)
+    cos_w = cos[offset : offset + T, :].to(x.device).to(x.dtype).unsqueeze(0).unsqueeze(0)
+    sin_w = sin[offset : offset + T, :].to(x.device).to(x.dtype).unsqueeze(0).unsqueeze(0)
 
     x1 = x[..., 0::2]
     x2 = x[..., 1::2]
@@ -104,7 +89,7 @@ class CausalSelfAttention(nn.Module):
     - Asymmetric Q vs KV heads (MHA / GQA / MQA)
     - Rotary Position Embeddings (RoPE)
     - O(1) Key-Value (KV) cache for autoregressive inference
-    - Multi-tier kernel dispatch: FA4 -> FA3 -> FA2 -> PyTorch SDPA
+    - Multi-tier kernel dispatch: FA4 -> FA2 -> PyTorch SDPA
     """
 
     def __init__(self, config: ModelConfig):
@@ -135,10 +120,8 @@ class CausalSelfAttention(nn.Module):
         # Identify active backend
         if HAS_FA4:
             self.backend = "FlashAttention-4 (CuTeDSL sm90+/sm100)"
-        elif HAS_FA3:
-            self.backend = "FlashAttention-3 (sm90+)"
         elif HAS_FA2:
-            self.backend = "FlashAttention-2 (sm80+)"
+            self.backend = "FlashAttention-2 (Ampere/Ada sm80+)"
         else:
             self.backend = "PyTorch-Native-SDPA"
 
@@ -154,7 +137,7 @@ class CausalSelfAttention(nn.Module):
         kv = self.kv_proj(x)
         k, v = kv.chunk(2, dim=-1)
 
-        # 2. Reshape to multi-head layout
+        # 2. Reshape to multi-head layout: (B, H, T, D)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -190,25 +173,23 @@ class CausalSelfAttention(nn.Module):
             y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         elif HAS_FA4 and x.is_cuda and FA4_FUNC is not None:
-            # FA4 accepts (batch, seqlen, nheads, headdim)
+            # FA4 layout: (batch, seqlen, nheads, headdim)
             q_fa = q.transpose(1, 2).contiguous()
             k_fa = k_rep.transpose(1, 2).contiguous()
             v_fa = v_rep.transpose(1, 2).contiguous()
             y = FA4_FUNC(q_fa, k_fa, v_fa, causal=True)
-            y = y.contiguous().view(B, T, C)
-
-        elif HAS_FA3 and x.is_cuda and FA3_FUNC is not None:
-            q_fa = q.transpose(1, 2).contiguous()
-            k_fa = k_rep.transpose(1, 2).contiguous()
-            v_fa = v_rep.transpose(1, 2).contiguous()
-            y = FA3_FUNC(q_fa, k_fa, v_fa, causal=True)
+            if isinstance(y, tuple):
+                y = y[0]
             y = y.contiguous().view(B, T, C)
 
         elif HAS_FA2 and x.is_cuda and FA2_FUNC is not None:
+            # FA2 layout: (batch, seqlen, nheads, headdim)
             q_fa = q.transpose(1, 2).contiguous()
             k_fa = k_rep.transpose(1, 2).contiguous()
             v_fa = v_rep.transpose(1, 2).contiguous()
             y = FA2_FUNC(q_fa, k_fa, v_fa, dropout_p=dropout_rate, causal=True)
+            if isinstance(y, tuple):
+                y = y[0]
             y = y.contiguous().view(B, T, C)
 
         else:
