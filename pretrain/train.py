@@ -198,7 +198,7 @@ def estimate_loss(model: torch.nn.Module, dataloader: DistributedShardedDataLoad
     for _ in range(eval_iters):
         x, y = dataloader.next_batch()
         with torch.amp.autocast(device_type=x.device.type, dtype=dtype):
-            _, loss = model(x, y)
+            _, loss, _ = model(x, y)
         losses.append(loss.item())
     model.train()
     mean_loss = float(np.mean(losses))
@@ -402,7 +402,7 @@ def main():
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
 
             with torch.amp.autocast(device_type=device_type, dtype=dtype):
-                _, loss = model(x, y)
+                _, loss, _ = model(x, y)
                 loss = loss / grad_accum_steps
                 accum_loss += loss.item()
 
