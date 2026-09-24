@@ -13,6 +13,10 @@ import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, Iterator, List, Optional
+
+# Ensure repository root is on sys.path regardless of execution context
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from datasets import load_dataset
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -126,6 +130,10 @@ def stream_source(source: str, config: Optional[str] = None, split: str = "train
                 for item in json.load(f):
                     yield item
     else:
+        # Automatic fallback for multi-config datasets like SmolTalk
+        if source == "HuggingFaceTB/smoltalk" and not config:
+            config = "all"
+
         hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         print(f"[Loader] Streaming from Hugging Face: '{source}' (config: {config})")
         ds = load_dataset(source, config, split=split, streaming=True, token=hf_token)

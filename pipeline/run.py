@@ -144,12 +144,14 @@ class PipelineOrchestrator:
 
         if not (has_train and has_val) and self.cfg.resume_from not in ("sft", "dpo"):
             print(f"⚠️ Pre-training binary shards missing in '{self.cfg.pretrain_data_dir}'.")
+            val_budget = max(10_000, min(500_000, self.cfg.bootstrap_pretrain_tokens // 20))
             print(f"   Executing token packing curriculum target: {self.cfg.bootstrap_pretrain_tokens:,} tokens...")
             cmd = [
                 sys.executable,
                 "-m", "data.prepare_packed_curriculum",
                 f"output_dir={self.cfg.pretrain_data_dir}",
                 f"total_tokens={self.cfg.bootstrap_pretrain_tokens}",
+                f"val_tokens={val_budget}",
             ]
             ret = subprocess.run(cmd)
             if ret.returncode != 0:
@@ -165,6 +167,7 @@ class PipelineOrchestrator:
                 sys.executable,
                 "-m", "data.prepare_sft",
                 "--source=HuggingFaceTB/smoltalk",
+                "--config=all",
                 f"--output_dir={out_dir}",
                 f"--max_samples={self.cfg.bootstrap_sft_samples}",
             ]
