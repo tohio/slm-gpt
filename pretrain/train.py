@@ -21,28 +21,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from dotenv import load_dotenv
 import wandb
 
-# Ensure repository root and package directories are on sys.path
+# Ensure repository root is on sys.path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 load_dotenv()
 
 from scaling.config import RuntimeConfig
 from tokenizer.factory import get_tokenizer
-
-# Robust multi-path resolution for Transformer architecture definition
-try:
-    from transformer.model import Transformer, TransformerConfig
-except ImportError:
-    try:
-        from transformer import Transformer, TransformerConfig
-    except ImportError:
-        try:
-            from model.transformer import Transformer, TransformerConfig
-        except ImportError:
-            try:
-                from core.model import Transformer, TransformerConfig
-            except ImportError:
-                from model import Transformer, TransformerConfig
+from transformer.model import DecoderOnlyTransformer as Transformer
+from transformer.config import ModelConfig as TransformerConfig
 
 
 class DistributedShardedDataLoader:
@@ -156,7 +143,6 @@ def parse_args():
     parser.add_argument("--save_interval", type=int, default=500)
     args = parser.parse_args()
 
-    # Parse positional k=v arguments passed via torchrun/cli
     for item in args.kv_args:
         if "=" in item:
             k, v = item.split("=", 1)
