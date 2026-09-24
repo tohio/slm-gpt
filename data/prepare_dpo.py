@@ -1,6 +1,6 @@
 """
 data/prepare_dpo.py: Preference Pair Harvester & Normalizer for DPO.
-Harvests multi-turn conversational preferences from allenai/tulu-3-preference-mix,
+Harvests multi-turn conversational preferences from allenai/llama-3.1-tulu-3-8b-preference-mixture,
 filters identical completions and length/verbosity exploits, authenticates via HF_TOKEN,
 and persists standardized preference pairs to JSONL.
 """
@@ -102,7 +102,7 @@ def normalize_preference_record(sample: Dict[str, Any]) -> Optional[Dict[str, st
 
 def prepare_dpo_dataset(
     output_path: str = "data/dpo/preference_pairs.jsonl",
-    dataset_name: str = "allenai/tulu-3-preference-mix",
+    dataset_name: str = "allenai/llama-3.1-tulu-3-8b-preference-mixture",
     total_samples: int = 7_000,
 ):
     """Harvests and normalizes preference pairs from Hugging Face Hub or local cache."""
@@ -151,7 +151,7 @@ def parse_cli_args() -> Dict[str, Any]:
     """Flexible CLI parser supporting both key=value and standard flag arguments."""
     kwargs: Dict[str, Any] = {
         "output_path": "data/dpo/preference_pairs.jsonl",
-        "dataset_name": "allenai/tulu-3-preference-mix",
+        "dataset_name": "allenai/llama-3.1-tulu-3-8b-preference-mixture",
         "total_samples": 7_000,
     }
 
