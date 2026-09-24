@@ -1,4 +1,7 @@
-"""tokenizer/bpe.py: Custom Byte-Pair Encoding (BPE) tokenizer with native ChatML token support."""
+"""
+tokenizer/bpe.py: Custom Byte-Pair Encoding (BPE) tokenizer with native special tokens
+for ChatML, reasoning chains (<think>), tool calling, and FIM code infilling.
+"""
 
 import json
 from typing import Dict, List, Optional, Set, Tuple
@@ -10,11 +13,25 @@ GPT2_SPLIT_PATTERN = (
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 )
 
-# Standard special tokens contract for slm-gpt
-DEFAULT_SPECIAL_TOKENS = {
+# Canonical special tokens contract for slm-gpt (fits within 50304 vocab allocation)
+DEFAULT_SPECIAL_TOKENS: Dict[str, int] = {
     "<|endoftext|>": 50256,
     "<|im_start|>": 50257,
     "<|im_end|>": 50258,
+    "<|pad|>": 50259,
+    "<s>": 50260,
+    "</s>": 50261,
+    "<|begin_of_text|>": 50262,
+    "<think>": 50263,
+    "</think>": 50264,
+    "<tool_call>": 50265,
+    "</tool_call>": 50266,
+    "<tool_response>": 50267,
+    "</tool_response>": 50268,
+    "<|fim_prefix|>": 50269,
+    "<|fim_middle|>": 50270,
+    "<|fim_suffix|>": 50271,
+    "<|fim_hole|>": 50272,
 }
 
 
@@ -79,8 +96,20 @@ class CustomBPETokenizer(BaseTokenizer):
         self._eot_id = self.special_tokens.get("<|endoftext|>", 50256)
         self._im_start_id = self.special_tokens.get("<|im_start|>", 50257)
         self._im_end_id = self.special_tokens.get("<|im_end|>", 50258)
+        self._pad_id = self.special_tokens.get("<|pad|>", 50259)
+        self._bos_id = self.special_tokens.get("<s>", 50260)
+        self._eos_id = self.special_tokens.get("</s>", 50261)
+        self._think_start_id = self.special_tokens.get("<think>", 50263)
+        self._think_end_id = self.special_tokens.get("</think>", 50264)
+        self._tool_call_start_id = self.special_tokens.get("<tool_call>", 50265)
+        self._tool_call_end_id = self.special_tokens.get("</tool_call>", 50266)
+        self._tool_resp_start_id = self.special_tokens.get("<tool_response>", 50267)
+        self._tool_resp_end_id = self.special_tokens.get("</tool_response>", 50268)
+        self._fim_prefix_id = self.special_tokens.get("<|fim_prefix|>", 50269)
+        self._fim_middle_id = self.special_tokens.get("<|fim_middle|>", 50270)
+        self._fim_suffix_id = self.special_tokens.get("<|fim_suffix|>", 50271)
+        self._fim_hole_id = self.special_tokens.get("<|fim_hole|>", 50272)
 
-        # Resolve newline ID: encode "\n" or fallback to base byte token ID
         nl_enc = self._encode_chunk("\n")
         if nl_enc:
             self._newline_id = nl_enc[0]
@@ -102,6 +131,58 @@ class CustomBPETokenizer(BaseTokenizer):
     @property
     def im_end_id(self) -> int:
         return self._im_end_id
+
+    @property
+    def pad_id(self) -> int:
+        return self._pad_id
+
+    @property
+    def bos_id(self) -> int:
+        return self._bos_id
+
+    @property
+    def eos_id(self) -> int:
+        return self._eos_id
+
+    @property
+    def think_start_id(self) -> int:
+        return self._think_start_id
+
+    @property
+    def think_end_id(self) -> int:
+        return self._think_end_id
+
+    @property
+    def tool_call_start_id(self) -> int:
+        return self._tool_call_start_id
+
+    @property
+    def tool_call_end_id(self) -> int:
+        return self._tool_call_end_id
+
+    @property
+    def tool_resp_start_id(self) -> int:
+        return self._tool_resp_start_id
+
+    @property
+    def tool_resp_end_id(self) -> int:
+        return self._tool_resp_end_id
+
+    @property
+    def fim_prefix_id(self) -> int:
+        return self._fim_prefix_id
+
+    @property
+    def fim_middle_id(self) -> int:
+        return self._fim_middle_id
+
+    @property
+    def fim_suffix_id(self) -> int:
+        return self._fim_suffix_id
+
+    @property
+    def fim_hole_id(self) -> int:
+        return self._fim_hole_id
 
     @property
     def newline_id(self) -> int:
