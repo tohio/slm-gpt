@@ -1,8 +1,8 @@
 """
 data/prepare_sft.py: 4-Pillar Composite SFT Dataset Assembler for slm-gpt.
 Harvests Code (Magicoder), Reasoning with <think> (OpenR1-Math), Constraints,
-and Dialogue (SmolTalk), performs AST validation, strips preambles/postambles,
-and outputs standardized train.jsonl and val.jsonl datasets.
+and Dialogue (SmolTalk), performs strict forward-compatible AST validation,
+strips preambles/postambles, and outputs standardized train.jsonl and val.jsonl datasets.
 """
 
 import ast
@@ -13,10 +13,15 @@ import random
 import re
 import sys
 from typing import Any, Dict, List, Optional
+import warnings
 
-# Ensure repository root is on sys.path
-REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
+# Ensure repository root is on sys.path regardless of execution context
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 
 # Regex rules for iterative preamble/postamble stripping
 PREAMBLE_PATTERNS = [
@@ -32,13 +37,19 @@ POSTAMBLE_PATTERNS = [
 
 
 def validate_python_ast(code: str) -> bool:
-    """Validates whether a code string is syntactically valid Python."""
+    """Validates whether code is syntactically sound and strictly forward-compatible.
+
+    Treats SyntaxWarning (such as deprecated invalid escape sequences) as fatal errors
+    so the model only trains on clean, future-proof Python code.
+    """
     if not code or not code.strip():
         return False
     try:
-        ast.parse(code)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SyntaxWarning)
+            ast.parse(code)
         return True
-    except SyntaxError:
+    except (SyntaxError, SyntaxWarning):
         return False
 
 
@@ -90,9 +101,8 @@ def harvest_code_samples(budget: int) -> List[Dict[str, Any]]:
     try:
         from datasets import load_dataset
 
-        ds = load_dataset("ise-uiuc/Magicoder-OSS-Instruct-75K", split="train")
+        ds = load_dataset("ise-uiuc/Magicoder-OSS-Instruct-75K", split="train", token=HF_TOKEN)
         for row in ds:
-            # Handle schema variations: instruction/response vs problem/solution
             prob = (
                 row.get("instruction")
                 or row.get("problem")
@@ -144,14 +154,13 @@ def harvest_reasoning_samples(budget: int) -> List[Dict[str, Any]]:
     try:
         from datasets import load_dataset
 
-        ds = load_dataset("open-r1/OpenR1-Math-220k", split="train")
+        ds = load_dataset("open-r1/OpenR1-Math-220k", split="train", token=HF_TOKEN)
         for row in ds:
             prob = (row.get("problem") or row.get("question") or "").strip()
             sol = (row.get("solution") or row.get("response") or "").strip()
             if not prob or not sol:
                 continue
 
-            # Ensure chain-of-thought formatting
             if "<think>" not in sol:
                 sol = f"<think>\nAnalyze the problem and solve systematically.\n</think>\n{sol}"
 
@@ -183,7 +192,7 @@ def harvest_constraint_samples(budget: int) -> List[Dict[str, Any]]:
     try:
         from datasets import load_dataset
 
-        ds = load_dataset("HuggingFaceTB/smoltalk", "smol-constraints", split="train")
+        ds = load_dataset("HuggingFaceTB/smoltalk", "smol-constraints", split="train", token=HF_TOKEN)
         for row in ds:
             msgs = row.get("messages", [])
             if len(msgs) >= 2:
@@ -204,7 +213,7 @@ def harvest_chitchat_samples(budget: int) -> List[Dict[str, Any]]:
     try:
         from datasets import load_dataset
 
-        ds = load_dataset("HuggingFaceTB/smoltalk", "everyday-conversations", split="train")
+        ds = load_dataset("HuggingFaceTB/smoltalk", "everyday-conversations", split="train", token=HF_TOKEN)
         for row in ds:
             msgs = row.get("messages", [])
             if len(msgs) >= 2:
@@ -224,6 +233,7 @@ def prepare_sft_splits(total_samples: int = 15_000, output_dir: str = "data/sft"
     print("   slm-gpt SFT 4-Pillar Dataset Assembler (Local Parquet Engine)")
     print("=" * 70)
     print(f"Target Budget: {total_samples:,} samples")
+    print(f"Auth Token:    {'✓ Detected' if HF_TOKEN else '⚠️ Not Found (Falling back to unauthenticated)'}")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -248,7 +258,6 @@ def prepare_sft_splits(total_samples: int = 15_000, output_dir: str = "data/sft"
     train_data = dataset[:train_count]
     val_data = dataset[train_count:]
 
-    # Canonical paths
     train_path = os.path.join(output_dir, "train.jsonl")
     val_path = os.path.join(output_dir, "val.jsonl")
 

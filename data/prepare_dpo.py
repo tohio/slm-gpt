@@ -1,8 +1,8 @@
 """
 data/prepare_dpo.py: Preference Pair Harvester & Normalizer for DPO.
-Normalizes conversational lists and QA pairs, filters identical answers
-and verbosity exploits, and persists preference pairs to JSONL.
-Supports both key=value CLI invocations and standard flag arguments.
+Harvests multi-turn conversational preferences from allenai/tulu-3-preference-mix,
+filters identical completions and length/verbosity exploits, authenticates via HF_TOKEN,
+and persists standardized preference pairs to JSONL.
 """
 
 import json
@@ -11,54 +11,65 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional
 
-# Ensure repository root is on sys.path
-REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
+# Ensure repository root is on sys.path regardless of execution context
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 
 
 def normalize_preference_record(sample: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """Normalizes raw preference data into canonical {system, prompt, chosen, rejected}.
+    """Normalizes raw preference data into canonical {prompt, chosen, rejected, [system]}.
 
     Returns None if:
       - Formats cannot be extracted.
-      - Chosen and rejected are identical.
-      - Length exceeds the 350-word verbosity threshold or extreme length disparity.
+      - Chosen and rejected completions are identical.
+      - Completion length exceeds 350 words or exhibits an extreme verbosity ratio (>8x).
     """
     system_text = sample.get("system", "")
     prompt_text = ""
     chosen_text = ""
     rejected_text = ""
 
-    # 1. Conversational format: list of role/content dicts
+    # Top-level prompt string if present
+    if sample.get("prompt") and isinstance(sample["prompt"], str):
+        prompt_text = sample["prompt"].strip()
+
+    # 1. Conversational format: list of message dictionaries
     if isinstance(sample.get("chosen"), list) and isinstance(sample.get("rejected"), list):
         chosen_list = sample["chosen"]
         rejected_list = sample["rejected"]
 
-        # Extract system prompt if present
-        for msg in chosen_list:
-            if isinstance(msg, dict) and msg.get("role") == "system":
-                system_text = msg.get("content", "").strip()
-                break
+        # Extract system prompt if present and not already set
+        if not system_text:
+            for msg in chosen_list:
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    system_text = msg.get("content", "").strip()
+                    break
 
-        # Extract user prompt (last user turn)
-        for msg in reversed(chosen_list):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                prompt_text = msg.get("content", "").strip()
-                break
+        # Extract user prompt from last user turn if not present at root
+        if not prompt_text:
+            for msg in reversed(chosen_list):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    prompt_text = msg.get("content", "").strip()
+                    break
 
-        # Extract assistant responses
+        # Extract assistant completions
         if chosen_list and isinstance(chosen_list[-1], dict) and chosen_list[-1].get("role") == "assistant":
             chosen_text = chosen_list[-1].get("content", "").strip()
         if rejected_list and isinstance(rejected_list[-1], dict) and rejected_list[-1].get("role") == "assistant":
             rejected_text = rejected_list[-1].get("content", "").strip()
 
-    # 2. Flat QA format
+    # 2. Flat string completion fallback
     else:
-        prompt_text = str(sample.get("prompt", "") or sample.get("question", "")).strip()
+        if not prompt_text:
+            prompt_text = str(sample.get("prompt", "") or sample.get("question", "")).strip()
         chosen_text = str(sample.get("chosen", "")).strip()
         rejected_text = str(sample.get("rejected", "")).strip()
 
-    # Integrity gates
+    # Integrity gate: All three core fields must be populated
     if not prompt_text or not chosen_text or not rejected_text:
         return None
 
@@ -91,16 +102,17 @@ def normalize_preference_record(sample: Dict[str, Any]) -> Optional[Dict[str, st
 
 def prepare_dpo_dataset(
     output_path: str = "data/dpo/preference_pairs.jsonl",
-    dataset_name: str = "argilla/dpo-mix-7k",
+    dataset_name: str = "allenai/tulu-3-preference-mix",
     total_samples: int = 7_000,
 ):
-    """Harvests and normalizes preference pairs from Hugging Face or local cache."""
+    """Harvests and normalizes preference pairs from Hugging Face Hub or local cache."""
     print("=" * 70)
     print("      slm-gpt DPO Preference Pair Assembler (Offline Engine)       ")
     print("=" * 70)
     print(f"Target Budget: {total_samples:,} pairs")
     print(f"Source:        {dataset_name}")
     print(f"Output:        {output_path}")
+    print(f"Auth Token:    {'✓ Detected' if HF_TOKEN else '⚠️ Not Found (Falling back to unauthenticated)'}")
 
     out_dir = os.path.dirname(output_path)
     if out_dir:
@@ -109,7 +121,7 @@ def prepare_dpo_dataset(
     from datasets import load_dataset
 
     print(f"Loading '{dataset_name}' from cache/Hub...")
-    ds = load_dataset(dataset_name, split="train")
+    ds = load_dataset(dataset_name, split="train", token=HF_TOKEN)
 
     valid_records: List[Dict[str, str]] = []
     skipped = 0
@@ -139,7 +151,7 @@ def parse_cli_args() -> Dict[str, Any]:
     """Flexible CLI parser supporting both key=value and standard flag arguments."""
     kwargs: Dict[str, Any] = {
         "output_path": "data/dpo/preference_pairs.jsonl",
-        "dataset_name": "argilla/dpo-mix-7k",
+        "dataset_name": "allenai/tulu-3-preference-mix",
         "total_samples": 7_000,
     }
 
