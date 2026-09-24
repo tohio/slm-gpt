@@ -6,8 +6,12 @@ Uses Token-Deficit Scheduling to guarantee exact curriculum distribution.
 
 import glob
 import os
+from pathlib import Path
 import sys
 from typing import Any, Dict, Iterator, List, Optional
+
+# Ensure repository root is on sys.path regardless of execution context
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from datasets import load_dataset
 import numpy as np
@@ -112,6 +116,10 @@ def pack_curriculum_to_shards(
     tokenizer_type: str = "tiktoken",
     tokenizer_path: Optional[str] = None,
 ):
+    """
+    Physically packs multiple sources into contiguous .bin files using token-deficit scheduling.
+    Guarantees uint16 dtype, train_*.bin and val_00000.bin naming.
+    """
     os.makedirs(output_dir, exist_ok=True)
     tokenizer = get_tokenizer(tokenizer_type, tokenizer_path)
     eot_id = tokenizer.eot_id
@@ -135,7 +143,7 @@ def pack_curriculum_to_shards(
     generators = [s.stream_docs(tokenizer) for s in sources]
     tokens_per_source = [0] * len(sources)
 
-    # 1. Harvest validation tokens first so pretrain/train.py never asserts on missing val split
+    # 1. Harvest validation partition first
     print("Extracting validation partition...")
     val_buffer: List[int] = []
     source_idx = 0
@@ -153,7 +161,7 @@ def pack_curriculum_to_shards(
     val_data.tofile(val_file)
     print(f"✓ Wrote validation shard: {val_file} ({len(val_data):,} tokens)")
 
-    # 2. Pack Training Shards (uint16 + train_XXXXX.bin pattern)
+    # 2. Pack Training Shards
     token_buffer: List[int] = []
     shard_idx = 0
     total_tokens_written = 0

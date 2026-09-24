@@ -147,7 +147,7 @@ class PipelineOrchestrator:
             print(f"   Executing token packing curriculum target: {self.cfg.bootstrap_pretrain_tokens:,} tokens...")
             cmd = [
                 sys.executable,
-                "data/prepare_packed_curriculum.py",
+                "-m", "data.prepare_packed_curriculum",
                 f"output_dir={self.cfg.pretrain_data_dir}",
                 f"total_tokens={self.cfg.bootstrap_pretrain_tokens}",
             ]
@@ -163,7 +163,7 @@ class PipelineOrchestrator:
             out_dir = os.path.dirname(self.cfg.sft_data_path) or "data/sft"
             cmd = [
                 sys.executable,
-                "data/prepare_sft.py",
+                "-m", "data.prepare_sft",
                 "--source=HuggingFaceTB/smoltalk",
                 f"--output_dir={out_dir}",
                 f"--max_samples={self.cfg.bootstrap_sft_samples}",
@@ -179,7 +179,7 @@ class PipelineOrchestrator:
             print(f"⚠️ DPO dataset missing at '{self.cfg.dpo_data_path}'. Extracting preference pairs...")
             cmd = [
                 sys.executable,
-                "data/prepare_dpo.py",
+                "-m", "data.prepare_dpo",
                 f"--output_path={self.cfg.dpo_data_path}",
                 f"--max_samples={self.cfg.bootstrap_dpo_samples}",
             ]
