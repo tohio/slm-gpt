@@ -13,6 +13,7 @@ import torch
 from scaling.engine import (
     derive_learning_rate,
     derive_model_config,
+    derive_training_budget,
     format_size,
     parse_size_str,
 )
@@ -35,6 +36,12 @@ class RuntimeConfig:
     # Resolved Architecture
     model_cfg: Optional[ModelConfig] = None
     max_seq_len: int = 2048
+
+    # Scaling Law Token & Step Budgets (Default: 50:1 tokens per parameter)
+    tokens_per_param: float = 50.0
+    target_tokens: int = 0
+    total_steps: int = 0
+    warmup_steps: int = 0
 
     # Batching & Optimization
     global_batch_size: int = 64
@@ -66,6 +73,7 @@ class RuntimeConfig:
         max_seq_len: int = 2048,
         global_batch_size: int = 64,
         micro_batch_size: Optional[int] = None,
+        tokens_per_param: float = 50.0,
         tokenizer_type: str = "tiktoken",
         tokenizer_path: Optional[str] = None,
         world_size: int = 1,
@@ -76,7 +84,7 @@ class RuntimeConfig:
         """
         target_int = parse_size_str(size)
 
-        # 1. Derive Architecture
+        # 1. Derive Architecture (enforces min_layers=8)
         model_cfg, actual_params = derive_model_config(
             target_params=target_int,
             vocab_size=vocab_size,
@@ -88,15 +96,23 @@ class RuntimeConfig:
         # 2. Derive Learning Rates
         max_lr, min_lr = derive_learning_rate(model_cfg.d_model)
 
-        # 3. Profile Hardware
+        # 3. Derive Scaling Law Token & Step Budgets (50:1)
+        target_tokens, total_steps, warmup_steps = derive_training_budget(
+            param_count=actual_params,
+            tokens_per_param=tokens_per_param,
+            max_seq_len=max_seq_len,
+            global_batch_size=global_batch_size,
+        )
+
+        # 4. Profile Hardware
         hw = profile_hardware(max_seq_len=max_seq_len, d_model=model_cfg.d_model)
         resolved_micro_batch = micro_batch_size if micro_batch_size is not None else hw.recommended_micro_batch
 
-        # 4. Calculate Gradient Accumulation Steps across the cluster
+        # 5. Calculate Gradient Accumulation Steps across the cluster
         per_step_capacity = resolved_micro_batch * world_size
         grad_accum = max(1, global_batch_size // per_step_capacity)
 
-        # 5. Dynamic Output Directory (zero hardcoded size paths)
+        # 6. Dynamic Output Directory (zero hardcoded size paths)
         output_dir = f"checkpoints/{stage}_{size_tag}"
 
         instance = cls(
@@ -108,6 +124,10 @@ class RuntimeConfig:
             output_dir=output_dir,
             model_cfg=model_cfg,
             max_seq_len=max_seq_len,
+            tokens_per_param=tokens_per_param,
+            target_tokens=target_tokens,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
             global_batch_size=global_batch_size,
             micro_batch_size=resolved_micro_batch,
             grad_accum_steps=grad_accum,
@@ -129,7 +149,6 @@ class RuntimeConfig:
         """Serializes configuration for artifact tracking."""
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         data = asdict(self)
-        # Convert non-serializable objects
         if self.model_cfg:
             data["model_cfg"] = asdict(self.model_cfg)
         if self.hardware:

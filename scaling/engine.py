@@ -1,8 +1,7 @@
 """
 scaling/engine.py: Dynamic model dimension and hyperparameter derivation engine.
-Derives transformer configurations at runtime without static presets.
-Rounds up gracefully to the minimum architectural floor when requested budgets
-fall below the vocabulary embedding minimum.
+Derives transformer configurations and token budgets at runtime without static presets.
+Enforces minimum depth invariants (min_layers=8) to prevent shallow sub-100M models.
 """
 
 import math
@@ -13,7 +12,7 @@ from transformer.config import ModelConfig
 
 
 def parse_size_str(size_input: Union[str, int]) -> int:
-    """Converts inputs like '125M', '350M', '1.2B', or integer parameter counts to an int."""
+    """Converts inputs like '70M', '125M', '350M', '1.2B', or integer parameter counts to an int."""
     if isinstance(size_input, int):
         return size_input
 
@@ -21,7 +20,7 @@ def parse_size_str(size_input: Union[str, int]) -> int:
     match = re.match(r"^([\d.]+)\s*([KMB])?$", s)
     if not match:
         raise ValueError(
-            f"Invalid size format: '{size_input}'. Expected format like '125M', '350M', '1B', or integer."
+            f"Invalid size format: '{size_input}'. Expected format like '70M', '125M', '350M', '1B', or integer."
         )
 
     num_str, suffix = match.groups()
@@ -31,7 +30,7 @@ def parse_size_str(size_input: Union[str, int]) -> int:
 
 
 def format_size(param_count: int) -> str:
-    """Formats exact integer parameter counts into readable tags (e.g., 126_758_400 -> '127M')."""
+    """Formats exact integer parameter counts into readable tags (e.g., 71_456_832 -> '71M')."""
     if param_count >= 1e9:
         val = param_count / 1e9
         return f"{val:.2f}B".rstrip("0").rstrip(".") if val % 1 != 0 else f"{int(val)}B"
@@ -73,13 +72,14 @@ def derive_model_config(
     vocab_size: int,
     max_seq_len: int = 2048,
     gqa_ratio: int = 3,
+    min_layers: int = 8,
 ) -> Tuple[ModelConfig, int]:
     """
     Derives transformer dimensions dynamically to match a target parameter budget.
-    If the requested budget is below the minimum viable footprint dictated by
-    vocabulary size and GQA invariants, automatically rounds up to the architectural floor.
+    Enforces min_layers=8 to prevent shallow degenerate architectures under heavy vocabularies.
 
     Invariants enforced:
+      - Minimum depth >= min_layers (default: 8)
       - Head dimension = 64 (ideal for Tensor Core hardware alignment)
       - n_heads = d_model // 64
       - n_heads % gqa_ratio == 0 (clean integer KV-heads)
@@ -98,7 +98,6 @@ def derive_model_config(
     smallest_viable_params = float("inf")
 
     # Search space: standard transformer widths (multiples of 64)
-    # Start at 192 (192 // 64 = 3 heads, minimum integer factor for GQA ratio 3)
     for d_model in range(192, 4096 + 1, 64):
         if d_model % 64 != 0:
             continue
@@ -123,12 +122,12 @@ def derive_model_config(
 
         emb_params = padded_vocab * d_model
 
-        # Track absolute smallest viable candidate (at least 2 layers)
+        # Smallest viable candidate tracking with minimum layers
         min_layers_cfg = ModelConfig(
             vocab_size=padded_vocab,
             max_seq_len=max_seq_len,
             d_model=d_model,
-            n_layers=2,
+            n_layers=min_layers,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
             d_ffn=d_ffn,
@@ -144,12 +143,12 @@ def derive_model_config(
         if rem_budget <= 0:
             continue
 
-        # Solve for layer count
-        n_layers = max(2, round(rem_budget / per_layer))
+        # Solve for layer count respecting min_layers
+        n_layers = max(min_layers, round(rem_budget / per_layer))
 
         # Check depth-to-width aspect ratio
         aspect = n_layers / d_model
-        if not (0.005 <= aspect <= 0.040):
+        if not (0.010 <= aspect <= 0.040):
             continue
 
         candidate_cfg = ModelConfig(
@@ -172,7 +171,6 @@ def derive_model_config(
             best_actual_params = actual_params
             best_config = candidate_cfg
 
-    # Floor Fallback: If requested budget is below the embedding minimum, round up gracefully
     if best_config is None and smallest_viable_cfg is not None:
         print(
             f"[Scaling Notice] Target '{target_params}' is below the architectural floor for vocab {vocab_size}. "
@@ -196,3 +194,21 @@ def derive_learning_rate(d_model: int) -> Tuple[float, float]:
     max_lr = 6e-4 * scale
     min_lr = max_lr * 0.1
     return max_lr, min_lr
+
+
+def derive_training_budget(
+    param_count: int,
+    tokens_per_param: float = 50.0,
+    max_seq_len: int = 2048,
+    global_batch_size: int = 64,
+) -> Tuple[int, int, int]:
+    """
+    Derives training token budget and optimizer step counts using scaling laws.
+    Default ratio: 50:1 (50 tokens per parameter for SLM capacity maximization).
+    Returns (target_tokens, total_steps, warmup_steps).
+    """
+    target_tokens = int(param_count * tokens_per_param)
+    tokens_per_step = global_batch_size * max_seq_len
+    total_steps = max(1, target_tokens // tokens_per_step)
+    warmup_steps = min(2000, max(100, int(total_steps * 0.03)))
+    return target_tokens, total_steps, warmup_steps
