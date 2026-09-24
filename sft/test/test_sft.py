@@ -1,4 +1,4 @@
-"""tests/test_sft.py: Unit tests for SFT Dataset and Prompt-Masked Collator."""
+"""sft/test/test_sft.py: Unit tests for SFT Dataset and Prompt-Masked Collator."""
 
 import pytest
 import torch
@@ -43,24 +43,49 @@ def test_prompt_masking_contract(tokenizer):
         asst_header_start != -1
     ), "Could not find assistant turn in encoded sequence."
 
-    # Verify everything before assistant completion is masked with IGNORE_INDEX
+    # Verify everything before assistant completion body is masked with IGNORE_INDEX
     asst_body_start = asst_header_start + window_len
     for i in range(asst_body_start):
         assert (
             labels[i] == IGNORE_INDEX
         ), f"Token at index {i} was not masked! Token ID: {input_ids[i]}"
 
-    # Verify assistant completion is unmasked
-    supervised_labels = labels[asst_body_start:]
+    # Verify assistant completion up to <|im_end|> is supervised
+    # Slices up to -1 to exclude the trailing turn delimiter newline
+    supervised_labels = labels[asst_body_start:-1]
+    assert len(supervised_labels) > 0, "No supervised labels found."
     assert all(
         l != IGNORE_INDEX for l in supervised_labels
-    ), "Assistant response contains unintended -100 masks."
+    ), "Assistant response body contains unintended -100 masks."
 
-    # Verify final tokens are <|im_end|> and newline
+    # Verify final tokens: <|im_end|> followed by turn delimiter \n
     assert input_ids[-2] == tokenizer.im_end_id
     assert input_ids[-1] == tokenizer.newline_id
+
+    # Verify label contract: <|im_end|> is supervised, trailing newline is masked
+    assert labels[-2] == tokenizer.im_end_id, "Terminating <|im_end|> must be supervised."
+    assert labels[-1] == IGNORE_INDEX, "Trailing newline after <|im_end|> must be masked with -100."
+
+
+def test_multi_turn_masking_contract(tokenizer):
+    """Verify that in multi-turn dialogues, each assistant turn is supervised and user turns are masked."""
+    dialogue = [
+        {"role": "user", "content": "Turn 1 question"},
+        {"role": "assistant", "content": "Turn 1 answer"},
+        {"role": "user", "content": "Turn 2 question"},
+        {"role": "assistant", "content": "Turn 2 answer"},
+    ]
+
+    dataset = SFTDataset([dialogue], tokenizer=tokenizer, max_seq_len=512)
+    sample = dataset[0]
+
+    input_ids = sample["input_ids"]
+    labels = sample["labels"]
+
+    # Verify terminating <|im_end|> is supervised and trailing newline is masked
+    assert input_ids[-2] == tokenizer.im_end_id
     assert labels[-2] == tokenizer.im_end_id
-    assert labels[-1] == tokenizer.newline_id
+    assert labels[-1] == IGNORE_INDEX
 
 
 def test_collator_dynamic_padding_and_alignment():
@@ -75,7 +100,7 @@ def test_collator_dynamic_padding_and_alignment():
         },
     ]
 
-    collator = SFTDataCollator(pad_token_id=50256, pad_to_multiple_of=16)
+    collator = SFTDataCollator(pad_token_id=50259, pad_to_multiple_of=16)
     batch = collator(features)
 
     input_ids = batch["input_ids"]
@@ -88,7 +113,11 @@ def test_collator_dynamic_padding_and_alignment():
     assert attention_mask.shape == (2, 16)
 
     # Check padding positions on first sample (seq_len = 5, pad_len = 11)
-    assert (input_ids[0, 5:] == 50256).all()
+    assert (input_ids[0, 5:] == 50259).all()
     assert (labels[0, 5:] == IGNORE_INDEX).all()
     assert (attention_mask[0, 5:] == 0).all()
     assert (attention_mask[0, :5] == 1).all()
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

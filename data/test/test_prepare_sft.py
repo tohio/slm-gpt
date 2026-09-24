@@ -17,16 +17,31 @@ from data.prepare_sft import (
     is_valid_python,
     sanitize_technical_response,
 )
-
 from tokenizer.tiktoken_wrap import PretrainedTiktokenTokenizer
 
 
 def test_sanitize_technical_response_preambles():
-    """Verify that sycophantic chat filler and introductory preambles are stripped."""
+    """Verify that conversational preambles are stripped according to PREAMBLE_PATTERNS."""
     dirty_samples = [
-        ("Sure! I'd be happy to explain that.\nHere is the function:\ndef add(a, b): return a + b", "def add(a, b): return a + b"),
-        ("Certainly! Here's the solution:\nimport math", "import math"),
-        ("Great question! In this script, we solve it:\nx = 1", "x = 1"),
+        # Pattern 0 + Pattern 1: Affirmation followed by code intro
+        (
+            "Sure! I'd be happy to explain that.\nHere is the function:\ndef add(a, b): return a + b",
+            "def add(a, b): return a + b",
+        ),
+        # Pattern 0 + Pattern 1: Shorter affirmation followed by solution intro
+        (
+            "Certainly! Here's the solution:\nimport math",
+            "import math",
+        ),
+        # Pattern 3: Standalone praise opening
+        (
+            "Great question!\nx = 1",
+            "x = 1",
+        ),
+        (
+            "Good question! x = 1",
+            "x = 1",
+        ),
     ]
     for raw, expected in dirty_samples:
         cleaned = sanitize_technical_response(raw)
@@ -96,3 +111,7 @@ def test_sft_jsonl_schema_and_tokenization():
         a_toks = tokenizer.encode(msgs[1]["content"])
         assert len(u_toks) > 0
         assert len(a_toks) > 0
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
