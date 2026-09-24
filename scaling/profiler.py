@@ -235,19 +235,29 @@ def tune_micro_batch_size(
     max_seq_len: int,
     total_memory_gb: float,
     world_size: int = 1,
+    vocab_size: int = 50304,
 ) -> int:
-    """Auto-tunes micro-batch sizes based on VRAM capacity."""
-    bytes_per_token = 2  # bfloat16
-    model_bytes = target_params * 2
-    optim_bytes = target_params * 8  # AdamW fp32 states
-    static_bytes = (model_bytes + optim_bytes) / (1024 ** 3)
+    """
+    Auto-tunes micro-batch size based on VRAM capacity.
+    Accounts for static weights, AdamW optimizer states, activations,
+    and un-chunked logits + PyTorch float32 cross-entropy workspace.
+    """
+    # 1. Static memory: Model (bf16: 2B), AdamW states (fp32: 8B), Gradients (4B) + CUDA/DDP context (2.5 GB)
+    static_gb = (target_params * 14) / (1024 ** 3) + 2.5
+    usable_vram = max(1.0, (total_memory_gb * 0.80) - static_gb)
 
-    available_vram = max(1.0, total_memory_gb - static_bytes)
-    activation_bytes_per_sample = (max_seq_len * bytes_per_token * 96) / (1024 ** 3)
+    # 2. Dynamic memory per sample (B=1):
+    # - Logits projection (bf16): T * V * 2 bytes
+    # - PyTorch cross_entropy logit reduction (fp32): T * V * 4 bytes
+    # - Transformer layer activations: ~T * hidden_dim * 80
+    vocab_workspace_bytes = max_seq_len * vocab_size * 6
+    activation_bytes = max_seq_len * 768 * 80
+    per_sample_gb = (vocab_workspace_bytes + activation_bytes) / (1024 ** 3)
 
-    estimated_batch = int(available_vram / max(activation_bytes_per_sample, 0.01))
+    estimated_batch = int(usable_vram / max(per_sample_gb, 0.1))
 
-    powers = [128, 64, 32, 16, 8, 4, 2, 1]
+    # Safe powers of two ceiling (32 for T=2048 prevents cross-entropy workspace OOM)
+    powers = [32, 16, 8, 4, 2, 1]
     for p in powers:
         if estimated_batch >= p:
             return p

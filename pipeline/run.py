@@ -7,12 +7,17 @@ sequential Pre-training -> SFT -> DPO execution with Health Gates.
 from dataclasses import dataclass
 import glob
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional
 
 import torch
+
+# Ensure repository root is on sys.path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 from scaling.config import RuntimeConfig
 from scaling.profiler import HardwareProfiler, tune_micro_batch_size
@@ -25,6 +30,7 @@ class PipelineConfig:
     tokenizer_type: str = "tiktoken"
     tokenizer_path: Optional[str] = None
     num_gpus: Optional[int] = None
+    micro_batch_size: Optional[int] = None  # CLI override support (e.g. micro_batch_size=32)
     resume_from: Optional[str] = None  # None, "sft", or "dpo"
 
     # Stage Data Paths
@@ -45,6 +51,12 @@ class PipelineConfig:
 
 def parse_cli_args(args_cls: type[PipelineConfig]) -> PipelineConfig:
     kwargs: Dict[str, Any] = {}
+    int_fields = {
+        "num_gpus", "micro_batch_size", "bootstrap_pretrain_tokens",
+        "bootstrap_sft_samples", "bootstrap_dpo_samples",
+        "pretrain_max_steps", "sft_epochs", "dpo_epochs"
+    }
+
     for arg in sys.argv[1:]:
         if "=" in arg:
             k, v = arg.split("=", 1)
@@ -53,12 +65,12 @@ def parse_cli_args(args_cls: type[PipelineConfig]) -> PipelineConfig:
                 orig_val = getattr(args_cls, k)
                 if isinstance(orig_val, bool):
                     kwargs[k] = v.lower() in ("true", "1", "yes")
-                elif isinstance(orig_val, int):
-                    kwargs[k] = int(v)
+                elif k in int_fields:
+                    kwargs[k] = int(v) if v.lower() != "none" else None
                 elif isinstance(orig_val, float):
-                    kwargs[k] = float(v)
+                    kwargs[k] = float(v) if v.lower() != "none" else None
                 else:
-                    kwargs[k] = v
+                    kwargs[k] = v if v.lower() != "none" else None
     return args_cls(**kwargs)
 
 
@@ -91,14 +103,19 @@ class PipelineOrchestrator:
         )
         self.size_tag = runtime_cfg.size_tag
 
-        # Auto-tune micro batch size based on actual profiled VRAM
-        self.auto_micro_batch = tune_micro_batch_size(
-            target_params=runtime_cfg.actual_params,
-            max_seq_len=runtime_cfg.model_cfg.max_seq_len,
-            total_memory_gb=self.hw_profile.total_memory_gb,
-            world_size=self.num_gpus,
-        )
-        print(f"[Auto-Tuner] Recommended Micro-Batch Size per GPU: {self.auto_micro_batch}")
+        # Honor manual CLI micro_batch_size if specified, otherwise auto-tune with vocab footprint
+        if cfg.micro_batch_size is not None:
+            self.auto_micro_batch = cfg.micro_batch_size
+            print(f"[Config] Manual Micro-Batch Size per GPU specified: {self.auto_micro_batch}")
+        else:
+            self.auto_micro_batch = tune_micro_batch_size(
+                target_params=runtime_cfg.actual_params,
+                max_seq_len=runtime_cfg.model_cfg.max_seq_len,
+                total_memory_gb=self.hw_profile.total_memory_gb,
+                world_size=self.num_gpus,
+                vocab_size=tok.vocab_size,
+            )
+            print(f"[Auto-Tuner] Recommended Micro-Batch Size per GPU: {self.auto_micro_batch}")
 
         # 4. Dynamic Checkpoint Paths
         self.pretrain_ckpt = f"checkpoints/pretrain_{self.size_tag}/best_model.pt"
@@ -144,7 +161,7 @@ class PipelineOrchestrator:
 
         if not (has_train and has_val) and self.cfg.resume_from not in ("sft", "dpo"):
             print(f"⚠️ Pre-training binary shards missing in '{self.cfg.pretrain_data_dir}'.")
-            val_budget = max(10_000, min(500_000, self.cfg.bootstrap_pretrain_tokens // 20))
+            val_budget = max(300_000, min(500_000, self.cfg.bootstrap_pretrain_tokens // 4))
             print(f"   Executing token packing curriculum target: {self.cfg.bootstrap_pretrain_tokens:,} tokens...")
             cmd = [
                 sys.executable,
