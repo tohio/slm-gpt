@@ -31,6 +31,9 @@ from tokenizer.factory import get_tokenizer
 from transformer.model import DecoderOnlyTransformer as Transformer
 from transformer.config import ModelConfig as TransformerConfig
 
+import warnings
+warnings.filterwarnings("ignore", message=".*Argument aux_data.*cannot be converted to a JitArgument.*")
+
 
 class DistributedShardedDataLoader:
     """

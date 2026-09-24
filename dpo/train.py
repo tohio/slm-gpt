@@ -35,6 +35,8 @@ try:
 except AttributeError:
     pass
 
+import warnings
+warnings.filterwarnings("ignore", message=".*Argument aux_data.*cannot be converted to a JitArgument.*")
 
 @dataclass
 class DPOArgs:
