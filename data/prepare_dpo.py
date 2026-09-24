@@ -1,33 +1,34 @@
 """
 data/prepare_dpo.py: Local-caching pairwise preference ingestion engine.
 
-Downloads preference datasets (e.g., argilla/dpo-mix-7k, ultrafeedback)
-locally via HF Hub to eliminate streaming connection deadlocks, parses
-conversational and direct preference schemas, and writes normalized
-prompt/chosen/rejected pairs to JSONL.
+Downloads preference datasets (default: allenai/llama-3.1-tulu-3-8b-preference-mixture)
+locally via HF Hub, samples uniformly across shards to guarantee multi-domain coverage,
+filters identical and length-exploited pairs, and writes normalized JSONL.
 """
 
 import argparse
-import gzip
 import json
+import math
 import os
 from pathlib import Path
+import random
 import sys
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, List, Optional
 
-# Ensure repository root is on sys.path regardless of execution context
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dotenv import load_dotenv
+load_dotenv()
+
 from huggingface_hub import HfApi, hf_hub_download
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-load_dotenv()
+random.seed(42)
 
 
 def _extract_turn_text(val: Any) -> str:
-    """Extracts contiguous text from a raw string or list of turn dictionaries."""
+    """Extracts raw text from either a string or a list of message dicts."""
     if isinstance(val, str):
         return val.strip()
     if isinstance(val, list):
@@ -43,16 +44,13 @@ def _extract_turn_text(val: Any) -> str:
 
 
 def normalize_preference_record(record: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """
-    Normalizes multi-turn message lists, conversational transcripts,
-    and flat prompt/chosen/rejected records into standard DPO schema.
-    """
+    """Standardizes records into raw prompt/chosen/rejected text."""
     prompt = record.get("prompt", "")
     chosen = record.get("chosen", "")
     rejected = record.get("rejected", "")
     system = record.get("system", "")
 
-    # Multi-turn conversation format (e.g., argilla/dpo-mix-7k, ultrafeedback)
+    # Multi-turn conversation format
     if isinstance(chosen, list) and len(chosen) > 0 and isinstance(chosen[0], dict):
         if not prompt and len(chosen) >= 2:
             prompt_turns = [t.get("content", "") for t in chosen[:-1] if t.get("role") != "system"]
@@ -86,6 +84,12 @@ def normalize_preference_record(record: Dict[str, Any]) -> Optional[Dict[str, st
     if chosen_str == rejected_str:
         return None
 
+    # Guardrail against verbosity reward hacking
+    len_c = len(chosen_str.split())
+    len_r = len(rejected_str.split())
+    if len_c > 2.2 * max(len_r, 1) and len_c > 350:
+        return None
+
     out = {
         "prompt": prompt_str,
         "chosen": chosen_str,
@@ -96,119 +100,91 @@ def normalize_preference_record(record: Dict[str, Any]) -> Optional[Dict[str, st
     return out
 
 
-def _stream_from_local_file(path: str) -> Iterator[Dict[str, Any]]:
-    """Yields parsed dictionaries from local parquet, jsonl, or jsonl.gz files."""
-    if path.endswith((".jsonl", ".jsonl.gz")):
-        opener = gzip.open if path.endswith(".gz") else open
-        with opener(path, "rt", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        yield json.loads(line)
-                    except Exception:
-                        continue
-    elif path.endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                yield from data
-    elif path.endswith(".parquet"):
-        pf = pq.ParquetFile(path)
-        for batch in pf.iter_batches(batch_size=512):
-            yield from batch.to_pylist()
-
-
-def _resolve_hf_shards(repo: str, subset: Optional[str], token: Optional[str]) -> List[str]:
-    """Finds all parquet or jsonl shards in a Hugging Face dataset repo."""
+def resolve_shards(repo_id: str, subset: Optional[str], token: Optional[str]) -> List[str]:
     api = HfApi(token=token)
     try:
-        files = api.list_repo_files(repo_id=repo, repo_type="dataset")
-        valid_files = [f for f in files if f.endswith((".parquet", ".jsonl", ".jsonl.gz"))]
-        if not valid_files:
-            return []
-
+        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+        parquets = [f for f in files if f.endswith(".parquet")]
         if subset:
-            matches = [f for f in valid_files if subset in f]
-            if matches:
-                return sorted(matches)
-
-        parquets = [f for f in valid_files if f.endswith(".parquet")]
-        return sorted(parquets) if parquets else sorted(valid_files)
+            parquets = [f for f in parquets if subset in f]
+        return sorted(parquets)
     except Exception as e:
-        print(f"[DPO Loader] Error querying repository '{repo}': {e}")
+        print(f"[Error] Failed to resolve shards in '{repo_id}': {e}")
         return []
 
 
-def stream_preference_source(
-    source: str,
-    subset: Optional[str] = None,
-) -> Iterator[Dict[str, Any]]:
-    """Yields raw preference items from local files or downloaded HF shards."""
-    source_path = Path(source)
-    if source_path.exists():
-        print(f"[DPO Loader] Ingesting local file: {source}")
-        yield from _stream_from_local_file(str(source_path))
-        return
-
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-    print(f"[DPO Loader] Resolving remote shards for '{source}'...")
-    shards = _resolve_hf_shards(source, subset, token)
-
-    if not shards:
-        raise FileNotFoundError(f"No valid .parquet or .jsonl data files found in '{source}'.")
-
-    for shard in shards:
-        print(f"[DPO Loader] Downloading shard: {shard}")
-        local_path = hf_hub_download(
-            repo_id=source,
-            filename=shard,
-            repo_type="dataset",
-            token=token,
-        )
-        file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        print(f"[DPO Loader] Cached locally: {os.path.basename(local_path)} ({file_size_mb:.1f} MB)")
-        yield from _stream_from_local_file(local_path)
-
-
 def prepare_dpo_dataset(
-    dataset_name: str,
+    dataset_name: str = "allenai/llama-3.1-tulu-3-8b-preference-mixture",
     output_path: str = "data/dpo/preference_pairs.jsonl",
     subset: Optional[str] = None,
-    max_samples: Optional[int] = 7_000,
+    max_samples: int = 7000,
 ):
-    """Downloads, standardizes, and writes preference pairs to local JSONL."""
     out_file = Path(output_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 
-    written_count = 0
-    pbar = tqdm(total=max_samples, unit="pairs", desc="Processing DPO Pairs")
+    print(f"[DPO Loader] Source: {dataset_name} | Target: {max_samples:,} pairs")
 
-    with open(out_file, "w", encoding="utf-8") as f_out:
-        for raw_record in stream_preference_source(dataset_name, subset=subset):
-            record = normalize_preference_record(raw_record)
-            if not record:
-                continue
+    local_source = Path(dataset_name)
+    if local_source.exists():
+        shards = sorted([str(p) for p in local_source.glob("*.parquet")]) if local_source.is_dir() else [str(local_source)]
+        is_local = True
+    else:
+        shards = resolve_shards(dataset_name, subset, token)
+        is_local = False
 
-            f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
-            written_count += 1
-            pbar.update(1)
+    if not shards:
+        raise FileNotFoundError(f"No parquet shards found for '{dataset_name}'.")
 
-            if max_samples and written_count >= max_samples:
+    quota_per_shard = max(1, math.ceil(max_samples / len(shards)))
+    collected_pairs: List[Dict[str, str]] = []
+
+    for i, shard in enumerate(shards):
+        if is_local:
+            local_path = shard
+        else:
+            print(f"[{i + 1}/{len(shards)}] Downloading remote shard: {shard}")
+            local_path = hf_hub_download(
+                repo_id=dataset_name,
+                filename=shard,
+                repo_type="dataset",
+                token=token,
+            )
+
+        shard_pairs = []
+        pf = pq.ParquetFile(local_path)
+        for batch in pf.iter_batches(batch_size=256):
+            for row in batch.to_pylist():
+                norm = normalize_preference_record(row)
+                if norm:
+                    shard_pairs.append(norm)
+                if len(shard_pairs) >= quota_per_shard:
+                    break
+            if len(shard_pairs) >= quota_per_shard:
                 break
 
-    pbar.close()
+        collected_pairs.extend(shard_pairs)
+        print(f"  ✓ Harvested {len(shard_pairs):,} pairs from shard {i + 1} (Total: {len(collected_pairs):,})")
+        if len(collected_pairs) >= max_samples:
+            break
+
+    random.shuffle(collected_pairs)
+    final_pairs = collected_pairs[:max_samples]
+
+    with open(out_file, "w", encoding="utf-8") as f_out:
+        for item in final_pairs:
+            f_out.write(json.dumps(item, ensure_ascii=False) + "\n")
+
     file_size_mb = os.path.getsize(out_file) / (1024 * 1024)
-    print(f"\n✓ DPO Preparation Complete:")
-    print(f"  -> File: {output_path} ({written_count:,} pairs, {file_size_mb:.2f} MB)")
+    print(f"\n✓ DPO Preparation Complete: {output_path} ({len(final_pairs):,} pairs, {file_size_mb:.2f} MB)")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download and prepare pairwise DPO preferences.")
-    parser.add_argument("--dataset_name", type=str, default="argilla/dpo-mix-7k", help="Hugging Face repo or local path")
-    parser.add_argument("--output_path", type=str, default="data/dpo/preference_pairs.jsonl", help="Destination JSONL path")
-    parser.add_argument("--subset", type=str, default=None, help="Dataset subset/config")
-    parser.add_argument("--max_samples", type=int, default=7000, help="Maximum preference pairs to collect")
+    parser.add_argument("--dataset_name", type=str, default="allenai/llama-3.1-tulu-3-8b-preference-mixture")
+    parser.add_argument("--output_path", type=str, default="data/dpo/preference_pairs.jsonl")
+    parser.add_argument("--subset", type=str, default=None)
+    parser.add_argument("--max_samples", type=int, default=7000)
 
     args = parser.parse_args()
     prepare_dpo_dataset(

@@ -1,270 +1,265 @@
 """
-data/prepare_sft.py: Source-agnostic conversational ingestion engine.
-
-Downloads data shards locally via Hugging Face Hub to prevent stream deadlocks,
-handles both local files and remote .parquet/.jsonl shards, normalizes schemas
-to ChatML via modular format adapters, and partitions into train/val/test splits.
+data/prepare_sft_dataset.py: Curated 4-Pillar SFT Dataset Generator (Local Disk Ingestion).
+Downloads parquet shards locally via hf_hub_download to eliminate HTTP streaming deadlocks,
+extracts and sanitizes samples, validates syntax, and writes balanced jsonl files.
 """
 
-import argparse
-import gzip
-import hashlib
+import ast
 import json
 import os
 from pathlib import Path
+import random
+import re
 import sys
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, List, Optional
 
-# Ensure repository root is on sys.path regardless of execution context
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dotenv import load_dotenv
-from huggingface_hub import HfApi, hf_hub_download
-import pyarrow.parquet as pq
-from tqdm import tqdm
-
 load_dotenv()
 
+from huggingface_hub import HfApi, hf_hub_download
+import pyarrow.parquet as pq
 
-class OpenAIFormatAdapter:
-    @staticmethod
-    def match(sample: Dict[str, Any]) -> bool:
-        return "messages" in sample and isinstance(sample["messages"], list)
+random.seed(42)
 
-    @staticmethod
-    def extract(sample: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
-        cleaned = []
-        for turn in sample.get("messages", []):
-            if not isinstance(turn, dict):
-                continue
-            role = str(turn.get("role", "")).strip()
-            content = str(turn.get("content", "")).strip()
-            if role in ("system", "user", "assistant") and content:
-                cleaned.append({"role": role, "content": content})
-        return cleaned if len(cleaned) >= 2 else None
+# =====================================================================
+# Sanitation & Validation Helpers
+# =====================================================================
 
+PREAMBLE_PATTERNS = [
+    r"^(?:Sure|Certainly|Of course|Definitely)[!,.]?\s*(?:I(?:'d| would)? be (?:happy|glad) to (?:help|assist|explain)[^.\n]*[.\n]+)?",
+    r"^Here(?:'s| is) (?:the|an?|your) (?:code|solution|implementation|python script|function)[^:\n]*:\s*",
+    r"^(?:In this (?:guide|tutorial|script)|To (?:achieve|do|solve) this)[^,\n]*,?\s*",
+    r"^(?:Great question|Good question)![ \t]*",
+]
 
-class ShareGPTFormatAdapter:
-    ROLE_MAP = {
-        "human": "user",
-        "user": "user",
-        "gpt": "assistant",
-        "chatgpt": "assistant",
-        "assistant": "assistant",
-        "system": "system",
-    }
+POSTAMBLE_PATTERNS = [
+    r"\n+(?:I hope (?:this|that) helps[^\n]*|Let me know if you (?:have any (?:other )?questions|need (?:further|more) help)[^\n]*)$",
+    r"\n+(?:Feel free to ask if you have any questions|Happy coding!)[^\n]*$",
+]
 
-    @staticmethod
-    def match(sample: Dict[str, Any]) -> bool:
-        return "conversations" in sample and isinstance(sample["conversations"], list)
+def sanitize_technical_response(text: str) -> str:
+    cleaned = text.strip()
+    for pat in PREAMBLE_PATTERNS:
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE).strip()
+    for pat in POSTAMBLE_PATTERNS:
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
 
-    @staticmethod
-    def extract(sample: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
-        cleaned = []
-        for turn in sample.get("conversations", []):
-            if not isinstance(turn, dict):
-                continue
-            raw_role = str(turn.get("from", "")).strip()
-            content = str(turn.get("value", "")).strip()
-            role = ShareGPTFormatAdapter.ROLE_MAP.get(raw_role)
-            if role and content:
-                cleaned.append({"role": role, "content": content})
-        return cleaned if len(cleaned) >= 2 else None
+def extract_python_snippet(text: str) -> Optional[str]:
+    code_blocks = re.findall(r"```(?:python)?\s*\n(.*?)\n```", text, flags=re.DOTALL)
+    if code_blocks:
+        return "\n".join(code_blocks)
+    return text if ("def " in text or "import " in text or "class " in text) else None
 
+def is_valid_python(code_str: str) -> bool:
+    try:
+        ast.parse(code_str)
+        return True
+    except Exception:
+        return False
 
-class AlpacaFormatAdapter:
-    @staticmethod
-    def match(sample: Dict[str, Any]) -> bool:
-        return "instruction" in sample and "output" in sample
+# =====================================================================
+# Local Shard Ingestion Helper
+# =====================================================================
 
-    @staticmethod
-    def extract(sample: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
-        instruction = str(sample.get("instruction", "")).strip()
-        context_input = str(sample.get("input", "")).strip()
-        response = str(sample.get("output", "")).strip()
-        if not instruction or not response:
-            return None
-        user_prompt = f"{instruction}\n\nContext:\n{context_input}" if context_input else instruction
-        return [
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": response},
-        ]
-
-
-ADAPTERS = [OpenAIFormatAdapter, ShareGPTFormatAdapter, AlpacaFormatAdapter]
-
-
-def normalize_record(record: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
-    """Inspects raw records across known schemas and returns canonical ChatML messages."""
-    for adapter in ADAPTERS:
-        if adapter.match(record):
-            messages = adapter.extract(record)
-            if messages:
-                roles = {m["role"] for m in messages}
-                if "user" in roles and "assistant" in roles:
-                    return messages
-    return None
-
-
-def assign_split_hash(text: str, val_ratio: float = 0.05, test_ratio: float = 0.05) -> str:
-    """Deterministically assigns sample to 'train', 'val', or 'test' via SHA256 prefix hashing."""
-    hash_val = int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:8], 16)
-    score = (hash_val % 100_000) / 100_000.0
-    if score < test_ratio:
-        return "test"
-    elif score < (test_ratio + val_ratio):
-        return "val"
-    return "train"
-
-
-def _stream_from_local_file(path: str) -> Iterator[Dict[str, Any]]:
-    if path.endswith((".jsonl", ".jsonl.gz")):
-        opener = gzip.open if path.endswith(".gz") else open
-        with opener(path, "rt", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        yield json.loads(line)
-                    except Exception:
-                        continue
-    elif path.endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                yield from data
-    elif path.endswith(".parquet"):
-        pf = pq.ParquetFile(path)
-        for batch in pf.iter_batches(batch_size=512):
-            yield from batch.to_pylist()
-
-
-def _resolve_hf_shards(repo: str, subset: Optional[str], token: Optional[str]) -> List[str]:
+def download_and_get_batches(repo_id: str, subset_filter: Optional[str], token: Optional[str]):
+    """Discovers and downloads parquet files to disk, yielding pyarrow record batches locally."""
     api = HfApi(token=token)
     try:
-        files = api.list_repo_files(repo_id=repo, repo_type="dataset")
-        valid_files = [f for f in files if f.endswith((".parquet", ".jsonl", ".jsonl.gz"))]
-        if not valid_files:
-            return []
-
-        if subset:
-            matches = [f for f in valid_files if subset in f]
-            if matches:
-                return sorted(matches)
-
-        parquets = [f for f in valid_files if f.endswith(".parquet")]
-        return sorted(parquets) if parquets else sorted(valid_files)
+        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+        parquets = [f for f in files if f.endswith(".parquet")]
+        if subset_filter:
+            parquets = [f for f in parquets if subset_filter in f]
+        parquets.sort()
     except Exception as e:
-        print(f"[Loader] Error querying repository '{repo}': {e}")
-        return []
-
-
-def stream_source(source: str, config: Optional[str] = None, split: str = "train") -> Iterator[Dict[str, Any]]:
-    source_path = Path(source)
-    if source_path.exists():
-        print(f"[Loader] Ingesting local source: {source}")
-        yield from _stream_from_local_file(str(source_path))
+        print(f"  [Error] Resolving shards for {repo_id}: {e}")
         return
 
-    # Parse multi-subset list
-    if config and "," in config:
-        subsets = [c.strip() for c in config.split(",") if c.strip()]
-    elif config and config != "all":
-        subsets = [config.strip()]
-    elif source == "HuggingFaceTB/smoltalk":
-        subsets = ["everyday-conversations", "smol-magpie-ultra"]
-    else:
-        subsets = [config] if config else [None]
-
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-
-    for subset in subsets:
-        subset_name = subset or "default"
-        print(f"[Loader] Resolving shard for '{source}' (subset: {subset_name})...")
-        shards = _resolve_hf_shards(source, subset, token)
-
-        if not shards:
-            print(f"[Warning] No matching shards found for subset '{subset_name}' in {source}.")
+    for filename in parquets:
+        try:
+            local_file = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type="dataset",
+                token=token,
+            )
+            pf = pq.ParquetFile(local_file)
+            for batch in pf.iter_batches(batch_size=256):
+                yield from batch.to_pylist()
+        except Exception as e:
+            print(f"  [Error] Downloading/reading {filename} from {repo_id}: {e}")
             continue
 
-        target_shard = shards[0]
-        print(f"[Loader] Downloading shard: {target_shard}")
-        local_cached_path = hf_hub_download(
-            repo_id=source,
-            filename=target_shard,
-            repo_type="dataset",
-            token=token,
-        )
-        file_size_mb = os.path.getsize(local_cached_path) / (1024 * 1024)
-        print(f"[Loader] Cached locally: {os.path.basename(local_cached_path)} ({file_size_mb:.1f} MB)")
+# =====================================================================
+# 4-Pillar Offline Harvest
+# =====================================================================
 
-        yield from _stream_from_local_file(local_cached_path)
+def harvest_code_samples(target_count: int, token: Optional[str]) -> List[Dict[str, Any]]:
+    print(f"\n[1/4] Harvesting {target_count:,} Code Execution samples (local cache)...")
+    samples = []
+    repo = "ise-uiuc/Magicoder-OSS-Instruct-75K"
+    
+    for row in download_and_get_batches(repo, subset_filter=None, token=token):
+        prob = row.get("problem", "").strip()
+        sol = row.get("solution", "").strip()
+        if not prob or not sol:
+            continue
 
+        cleaned_sol = sanitize_technical_response(sol)
+        code_cand = extract_python_snippet(cleaned_sol)
+        if code_cand and not is_valid_python(code_cand):
+            continue
 
-def prepare_dataset(
-    source: str,
-    config: Optional[str] = None,
+        samples.append({
+            "messages": [
+                {"role": "user", "content": prob},
+                {"role": "assistant", "content": cleaned_sol}
+            ],
+            "category": "code"
+        })
+        if len(samples) >= target_count:
+            break
+
+    print(f"  ✓ Collected {len(samples):,} code samples.")
+    return samples
+
+def harvest_math_reasoning(target_count: int, token: Optional[str]) -> List[Dict[str, Any]]:
+    print(f"\n[2/4] Harvesting {target_count:,} Math/Reasoning samples with <think> (local cache)...")
+    samples = []
+    repo = "open-r1/OpenR1-Math-220k"
+    
+    for row in download_and_get_batches(repo, subset_filter=None, token=token):
+        prob = row.get("problem", "").strip()
+        sol = row.get("solution", "").strip()
+        if not prob or not sol:
+            continue
+
+        if "<think>" in sol and "</think>" in sol:
+            formatted_sol = sol
+        else:
+            formatted_sol = f"<think>\n{sol}\n</think>"
+
+        samples.append({
+            "messages": [
+                {"role": "user", "content": prob},
+                {"role": "assistant", "content": formatted_sol}
+            ],
+            "category": "math_cot"
+        })
+        if len(samples) >= target_count:
+            break
+
+    print(f"  ✓ Collected {len(samples):,} reasoning samples.")
+    return samples
+
+def harvest_constraints(target_count: int, token: Optional[str]) -> List[Dict[str, Any]]:
+    print(f"\n[3/4] Harvesting {target_count:,} Constraint Task samples (local cache)...")
+    samples = []
+    repo = "HuggingFaceTB/smoltalk"
+
+    for row in download_and_get_batches(repo, subset_filter="smol-constraints", token=token):
+        msgs = row.get("messages", [])
+        if len(msgs) >= 2:
+            user_msg = msgs[0]["content"].strip()
+            asst_msg = sanitize_technical_response(msgs[1]["content"].strip())
+            if user_msg and asst_msg:
+                samples.append({
+                    "messages": [
+                        {"role": "user", "content": user_msg},
+                        {"role": "assistant", "content": asst_msg}
+                    ],
+                    "category": "constraint_task"
+                })
+        if len(samples) >= target_count:
+            break
+
+    print(f"  ✓ Collected {len(samples):,} constraint samples.")
+    return samples
+
+def harvest_chitchat(target_count: int, token: Optional[str]) -> List[Dict[str, Any]]:
+    print(f"\n[4/4] Harvesting {target_count:,} Chit-Chat samples (local cache)...")
+    samples = []
+    repo = "HuggingFaceTB/smoltalk"
+
+    for row in download_and_get_batches(repo, subset_filter="everyday-conversations", token=token):
+        msgs = row.get("messages", [])
+        if len(msgs) >= 2:
+            cleaned_turns = []
+            valid = True
+            for m in msgs:
+                role = m.get("role", "")
+                content = m.get("content", "").strip()
+                if not role or not content:
+                    valid = False
+                    break
+                cleaned_turns.append({"role": role, "content": content})
+            if valid and len(cleaned_turns) >= 2:
+                samples.append({
+                    "messages": cleaned_turns,
+                    "category": "chitchat"
+                })
+        if len(samples) >= target_count:
+            break
+
+    print(f"  ✓ Collected {len(samples):,} conversational samples.")
+    return samples
+
+# =====================================================================
+# Main Assembler
+# =====================================================================
+
+def prepare_sft_splits(
+    total_samples: int = 15_000,
     output_dir: str = "data/sft",
     val_ratio: float = 0.05,
-    test_ratio: float = 0.05,
-    max_samples: Optional[int] = None,
-    split: str = "train",
 ):
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 
-    files = {
-        "train": open(out_path / "train.jsonl", "w", encoding="utf-8"),
-        "val": open(out_path / "val.jsonl", "w", encoding="utf-8"),
-        "test": open(out_path / "test.jsonl", "w", encoding="utf-8"),
-    }
-    counts = {"train": 0, "val": 0, "test": 0}
-    pbar = tqdm(total=max_samples, unit="convs", desc="Processing SFT Data")
+    n_code = int(total_samples * 0.30)
+    n_math = int(total_samples * 0.30)
+    n_task = int(total_samples * 0.25)
+    n_chat = total_samples - (n_code + n_math + n_task)
 
-    try:
-        for idx, raw_record in enumerate(stream_source(source, config=config, split=split)):
-            messages = normalize_record(raw_record)
-            if not messages:
-                continue
+    print("=" * 70)
+    print("   slm-gpt SFT 4-Pillar Dataset Assembler (Local Parquet Engine)")
+    print("=" * 70)
+    print(f"Target Budget: {total_samples:,} samples")
 
-            user_content = next((m["content"] for m in messages if m["role"] == "user"), str(idx))
-            split_name = assign_split_hash(user_content, val_ratio=val_ratio, test_ratio=test_ratio)
+    dataset: List[Dict[str, Any]] = []
+    dataset.extend(harvest_code_samples(n_code, token))
+    dataset.extend(harvest_math_reasoning(n_math, token))
+    dataset.extend(harvest_constraints(n_task, token))
+    dataset.extend(harvest_chitchat(n_chat, token))
 
-            files[split_name].write(json.dumps({"messages": messages}, ensure_ascii=False) + "\n")
-            counts[split_name] += 1
-            pbar.update(1)
+    random.shuffle(dataset)
 
-            if max_samples and sum(counts.values()) >= max_samples:
-                break
-    finally:
-        for f in files.values():
-            f.close()
-        pbar.close()
+    n_val = max(200, int(len(dataset) * val_ratio))
+    val_set = dataset[:n_val]
+    train_set = dataset[n_val:]
 
-    total = sum(counts.values())
-    print(f"\nSFT Dataset Preparation Complete ({total:,} dialogues):")
-    for s in ("train", "val", "test"):
-        pct = (counts[s] / max(1, total)) * 100
-        print(f"  -> {s:<5}.jsonl: {counts[s]:>6,} ({pct:>4.1f}%)")
+    train_path = os.path.join(output_dir, "train_sft.jsonl")
+    val_path = os.path.join(output_dir, "val_sft.jsonl")
+
+    with open(train_path, "w", encoding="utf-8") as f:
+        for s in train_set:
+            f.write(json.dumps(s) + "\n")
+
+    with open(val_path, "w", encoding="utf-8") as f:
+        for s in val_set:
+            f.write(json.dumps(s) + "\n")
+
+    print("\n" + "=" * 70)
+    print("✓ Successfully generated SFT datasets (Offline):")
+    print(f"  Train: {train_path} ({len(train_set):,} samples)")
+    print(f"  Val:   {val_path} ({len(val_set):,} samples)")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingest and partition conversational SFT data.")
-    parser.add_argument("--source", type=str, required=True, help="Hugging Face repo or local file path")
-    parser.add_argument("--config", type=str, default=None, help="Dataset config or comma-separated subsets")
-    parser.add_argument("--output_dir", type=str, default="data/sft", help="Destination directory")
-    parser.add_argument("--val_ratio", type=float, default=0.05, help="Validation partition ratio")
-    parser.add_argument("--test_ratio", type=float, default=0.05, help="Test partition ratio")
-    parser.add_argument("--max_samples", type=int, default=50_000, help="Maximum samples to process")
-    parser.add_argument("--split", type=str, default="train", help="Hugging Face split name")
-
-    args = parser.parse_args()
-    prepare_dataset(
-        source=args.source,
-        config=args.config,
-        output_dir=args.output_dir,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        max_samples=args.max_samples,
-        split=args.split,
-    )
+    budget = 15_000
+    if len(sys.argv) > 1:
+        budget = int(sys.argv[1].split("=")[-1])
+    prepare_sft_splits(total_samples=budget)

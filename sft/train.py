@@ -2,13 +2,13 @@
 sft/train.py: Supervised Fine-Tuning execution engine for slm-gpt.
 
 Features:
-- Dynamic Learning Rate Scaling across model dimensions and step budgets.
-- Special token warm-start for <|im_start|> and <|im_end|>.
-- Native mixed precision (bfloat16 / float16 GradScaler auto-dispatch).
-- FlashAttention-safe qualitative generation during periodic evaluation.
-- Gradient accumulation with step-loss telemetry.
+- Calibrated SFT LR scaling (3.0e-5 base, 10x lower than pre-training).
+- Best-checkpoint tracking (best_sft_model.pt) on validation loss.
+- Early stopping with configurable patience to prevent over-fitting.
+- Comprehensive special-token warm-start (<|im_start|>, <|im_end|>, <think>, </think>, <|pad|>).
+- Native bfloat16 / float16 GradScaler auto-dispatch.
+- Extended qualitative evaluation (384 tokens) to inspect <think> reasoning trajectories.
 - Strict prompt loss masking (ignore_index=-100) ensuring loss is on assistant tokens + <|im_end|>.
-- Validation perplexity evaluation loop.
 """
 
 import os
@@ -50,8 +50,8 @@ warnings.filterwarnings("ignore", message=".*Argument aux_data.*cannot be conver
 @dataclass
 class SFTArgs:
     # Model & Data Paths
-    data_path: str = "data/sft/train.jsonl"
-    val_path: Optional[str] = "data/sft/val.jsonl"
+    data_path: str = "data/sft/train_sft.jsonl"
+    val_path: Optional[str] = "data/sft/val_sft.jsonl"
     pretrained_ckpt: str = "checkpoints/pretrain_125M/best_model.pt"
     output_dir: str = "checkpoints/sft_125M"
 
@@ -62,41 +62,40 @@ class SFTArgs:
     # Optimization Hyperparameters
     per_device_batch_size: int = 16
     gradient_accumulation_steps: int = 2  # Effective batch size = 32
-    learning_rate: float = 0.0            # 0.0 = auto-scale dynamically
+    learning_rate: float = 0.0            # 0.0 = auto-scale dynamically to ~3.0e-5
     min_lr_ratio: float = 0.1
     weight_decay: float = 0.01
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     max_grad_norm: float = 1.0
-    epochs: int = 3
+    epochs: int = 2                       # 1-2 epochs max for curated SFT
     warmup_ratio: float = 0.05
     max_seq_len: int = 1024
 
-    # Runtime & Checkpointing
+    # Runtime, Checkpointing & Early Stopping
     eval_interval_steps: int = 50
     save_interval_epochs: int = 1
     log_interval_steps: int = 10
+    early_stopping_patience: int = 4      # Halt if val loss does not improve for 4 evals (200 steps)
     seed: int = 1337
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 EVAL_PROMPTS = [
-    "Hello! Who are you and what can you do?",
     "What is the capital of France?",
-    "What is 2 + 2?",
     "Write a Python function to check if a word is a palindrome.",
+    "If a box contains 3 red balls and 5 blue balls, what is the probability of drawing a red ball?",
+    "Explain what a transformer attention head does in one concise sentence.",
 ]
 
 
 def compute_dynamic_lr(d_model: int, total_steps: int) -> float:
     """
-    Applies empirical muP scaling to calibrate peak learning rate.
-    Small models (~768 dim) need ~3.0e-4 to overcome raw pretraining priors.
+    Calibrates peak learning rate for SFT.
+    Small models (~768 dim) must train at ~3.0e-5 to preserve pre-trained weights.
     """
-    base_lr = 3.0e-4 * (768.0 / max(d_model, 1))
-    if total_steps < 500:
-        base_lr *= 1.2
-    return round(base_lr, 7)
+    base_lr = 3.0e-5 * (768.0 / max(d_model, 1))
+    return round(base_lr, 8)
 
 
 def configure_precision(device: str) -> Tuple[torch.dtype, bool, Any]:
@@ -125,7 +124,7 @@ def log_sample_generations(
     tokenizer,
     device: str,
     compute_dtype: torch.dtype = torch.bfloat16,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 384,
 ):
     model.eval()
     print("\n" + "=" * 70)
@@ -156,10 +155,10 @@ def log_sample_generations(
             stopped_cleanly = im_end_str in assistant_part
             clean_text = assistant_part.split(im_end_str)[0].strip()
 
-            print(f"\n[{i}] User:      \"{user_prompt}\"")
-            print(f"    Assistant: {clean_text}")
+            print(f"\n[{i}] User: \"{user_prompt}\"")
+            print(f"Assistant:\n{clean_text}")
             status = "✓ Stopped with <|im_end|>" if stopped_cleanly else "… (Max tokens cutoff)"
-            print(f"    Status:    {status}")
+            print(f"Status: {status}")
 
     print("=" * 70 + "\n")
     model.train()
@@ -300,14 +299,19 @@ def train(args: SFTArgs):
     state_dict = checkpoint.get("model_state_dict", checkpoint.get("model", checkpoint))
     model.load_state_dict(state_dict, strict=False)
 
-    # Special token warm-start: Initialize newly introduced tokens from existing embedding distribution
+    # Comprehensive Special Token Warm-Start
     with torch.no_grad():
-        im_start_id = getattr(tokenizer, "im_start_id", 50257)
-        im_end_id = getattr(tokenizer, "im_end_id", 50258)
+        special_candidates = [
+            getattr(tokenizer, "im_start_id", 50257),
+            getattr(tokenizer, "im_end_id", 50258),
+            getattr(tokenizer, "pad_id", 50259),
+            getattr(tokenizer, "think_start_id", 50263),
+            getattr(tokenizer, "think_end_id", 50264),
+        ]
         base_mean = model.wte.weight[:50256].mean(dim=0)
         base_std = model.wte.weight[:50256].std(dim=0)
 
-        for tid in (im_start_id, im_end_id):
+        for tid in special_candidates:
             if tid < model.wte.weight.size(0) and model.wte.weight[tid].norm() < 0.1:
                 model.wte.weight[tid].copy_(base_mean + torch.randn_like(base_mean) * base_std * 0.1)
 
@@ -317,18 +321,17 @@ def train(args: SFTArgs):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[Architecture] Initialized {config.n_layers} layers, {total_params:,} parameters ({total_params/1e6:.2f}M).")
 
-    # Optimizer & Schedule
+    # Optimizer & Steps
     steps_per_epoch = max(1, math.ceil(len(train_loader) / max(1, args.gradient_accumulation_steps)))
     total_training_steps = max(1, steps_per_epoch * args.epochs)
     warmup_steps = int(total_training_steps * args.warmup_ratio)
 
-    # Dynamic Learning Rate Resolution
-    if args.learning_rate <= 0.0 or args.learning_rate == 2.5e-5:
+    if args.learning_rate <= 0.0:
         effective_lr = compute_dynamic_lr(config.d_model, total_training_steps)
-        print(f"[Optimization] Dynamically scaled Peak Learning Rate: {effective_lr:.2e} (based on d_model={config.d_model})")
+        print(f"[Optimization] Dynamically calibrated Peak SFT LR: {effective_lr:.2e} (d_model={config.d_model})")
     else:
         effective_lr = args.learning_rate
-        print(f"[Optimization] Using user-specified Peak Learning Rate: {effective_lr:.2e}")
+        print(f"[Optimization] Using user-specified Peak LR: {effective_lr:.2e}")
 
     decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
     nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
@@ -350,15 +353,19 @@ def train(args: SFTArgs):
         min_lr_ratio=args.min_lr_ratio,
     )
 
+    print("=" * 65)
     print(f"Total Epochs:          {args.epochs}")
     print(f"Per-Device Batch Size: {args.per_device_batch_size}")
-    print(f"Gradient Accum Steps:  {args.gradient_accumulation_steps}")
+    print(f"Gradient Accum Steps:  {args.gradient_accumulation_steps} (Effective Batch = {args.per_device_batch_size * args.gradient_accumulation_steps})")
     print(f"Total Optimizer Steps: {total_training_steps}")
     print(f"Warmup Steps:          {warmup_steps}")
-    print("-" * 65)
+    print(f"Early Stopping Window: {args.early_stopping_patience} evals ({args.early_stopping_patience * args.eval_interval_steps} steps)")
+    print("=" * 65)
 
-    # Training Loop
     global_step = 0
+    best_val_loss = float("inf")
+    patience_counter = 0
+
     model.train()
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
@@ -421,40 +428,41 @@ def train(args: SFTArgs):
                     )
                     running_loss = 0.0
 
-                if global_step % args.eval_interval_steps == 0:
+                # Validation & Checkpoint Selection
+                if global_step % args.eval_interval_steps == 0 or global_step == total_training_steps:
                     val_loss, val_ppl = evaluate(model, val_loader, args.device, compute_dtype)
                     print(f"\n--> [Eval @ Step {global_step}] Val Loss: {val_loss:.4f} | Perplexity: {val_ppl:.2f}")
+
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        patience_counter = 0
+                        best_path = os.path.join(args.output_dir, "best_sft_model.pt")
+                        torch.save(
+                            {
+                                "epoch": epoch + 1,
+                                "global_step": global_step,
+                                "val_loss": val_loss,
+                                "val_perplexity": val_ppl,
+                                "model_state_dict": model.state_dict(),
+                                "config": asdict(config),
+                            },
+                            best_path,
+                        )
+                        print(f"    ★ New minimum val loss! Checkpoint saved -> {best_path}")
+                    else:
+                        patience_counter += 1
+                        print(f"    ⚠ Val loss did not improve ({patience_counter}/{args.early_stopping_patience})")
+
                     log_sample_generations(model, tokenizer, args.device, compute_dtype)
+
+                    if patience_counter >= args.early_stopping_patience:
+                        print(f"\n[Early Stopping] Triggered at step {global_step}. Validation loss diverged. Terminating run.")
+                        return
 
         epoch_duration = time.time() - epoch_start_time
         print(f"Epoch {epoch + 1} completed in {epoch_duration:.2f}s")
 
-        if (epoch + 1) % args.save_interval_epochs == 0 or (epoch + 1) == args.epochs:
-            ckpt_name = f"sft_epoch_{epoch + 1}.pt"
-            save_path = os.path.join(args.output_dir, ckpt_name)
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "global_step": global_step,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "config": asdict(config),
-                },
-                save_path,
-            )
-            print(f"[Checkpoint] Saved model snapshot to: {save_path}")
-
-    final_path = os.path.join(args.output_dir, "sft_final.pt")
-    torch.save(
-        {
-            "global_step": global_step,
-            "model_state_dict": model.state_dict(),
-            "config": asdict(config),
-        },
-        final_path,
-    )
-    print(f"✓ SFT Run Completed. Final reference policy written to: {final_path}")
+    print(f"\n✓ SFT Completed. Best checkpoint preserved at: {os.path.join(args.output_dir, 'best_sft_model.pt')}")
 
 
 if __name__ == "__main__":

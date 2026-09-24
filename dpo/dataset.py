@@ -1,6 +1,6 @@
 """
 dpo/dataset.py: Pairwise preference dataset parser for ChatML format.
-Masks prompt tokens and computes supervision loss exclusively on response tokens.
+Masks prompt tokens and computes supervision loss exclusively on response tokens up to <|im_end|>.
 """
 
 import json
@@ -42,9 +42,9 @@ class PreferenceDataset(Dataset):
         else:
             raise ValueError("Data must be a filepath (str) or a list of dictionaries.")
 
-        self.im_start_id = self.tokenizer.im_start_id
-        self.im_end_id = self.tokenizer.im_end_id
-        self.newline_id = self.tokenizer.newline_id
+        self.im_start_id = getattr(self.tokenizer, "im_start_id", 50257)
+        self.im_end_id = getattr(self.tokenizer, "im_end_id", 50258)
+        self.newline_id = getattr(self.tokenizer, "newline_id", 10)
 
     def _load_data(self, path: str) -> List[Dict[str, str]]:
         records = []
@@ -78,12 +78,12 @@ class PreferenceDataset(Dataset):
         input_ids.extend(usr_tokens)
         labels.extend([IGNORE_INDEX] * len(usr_tokens))
 
-        # 3. Assistant turn -> header masked, response body + <|im_end|>\n supervised
+        # 3. Assistant turn -> header masked; response supervised; trailing \n masked
         asst_hdr = [self.im_start_id] + self.tokenizer.encode("assistant") + [self.newline_id]
-        asst_body = self.tokenizer.encode(response.strip()) + [self.im_end_id] + [self.newline_id]
+        asst_body = self.tokenizer.encode(response.strip()) + [self.im_end_id]
 
-        input_ids.extend(asst_hdr + asst_body)
-        labels.extend([IGNORE_INDEX] * len(asst_hdr) + asst_body)
+        input_ids.extend(asst_hdr + asst_body + [self.newline_id])
+        labels.extend([IGNORE_INDEX] * len(asst_hdr) + asst_body + [IGNORE_INDEX])
 
         # Truncate to maximum context window
         if len(input_ids) > self.max_seq_len:
