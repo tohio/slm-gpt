@@ -27,29 +27,34 @@ if torch.cuda.is_available():
     # FlashAttention-4 / FlashAttention-3 target Hopper (sm90) and Blackwell (sm100/sm120)
     if major >= 9:
         try:
-            from flash_attn_4 import flash_attn_func as fa4_f
+            from flash_attn.cute import flash_attn_func as fa4_f
             FA4_FUNC = fa4_f
             HAS_FA4 = True
-        except ImportError:
+        except (ImportError, Exception):
             try:
-                from flash_attn_interface import flash_attn_func as fa3_f
-                FA3_FUNC = fa3_f
-                HAS_FA3 = True
-            except ImportError:
+                from flash_attn_4 import flash_attn_func as fa4_f
+                FA4_FUNC = fa4_f
+                HAS_FA4 = True
+            except (ImportError, Exception):
                 try:
-                    from flash_attn_3 import flash_attn_interface as fa3_mod
-                    FA3_FUNC = fa3_mod.flash_attn_func
+                    from flash_attn_interface import flash_attn_func as fa3_f
+                    FA3_FUNC = fa3_f
                     HAS_FA3 = True
-                except ImportError:
-                    pass
+                except (ImportError, Exception):
+                    try:
+                        from flash_attn_3 import flash_attn_interface as fa3_mod
+                        FA3_FUNC = fa3_mod.flash_attn_func
+                        HAS_FA3 = True
+                    except (ImportError, Exception):
+                        pass
 
-    # FlashAttention-2 fallback for Ampere (sm80), Ada (sm89)
+    # FlashAttention-2 fallback for Ampere (sm80), Ada (sm89), or Hopper fallback
     if not (HAS_FA4 or HAS_FA3) and major >= 8:
         try:
             from flash_attn import flash_attn_func as fa2_f
             FA2_FUNC = fa2_f
             HAS_FA2 = True
-        except ImportError:
+        except (ImportError, Exception):
             pass
 
 
@@ -186,23 +191,23 @@ class CausalSelfAttention(nn.Module):
 
         elif HAS_FA4 and x.is_cuda and FA4_FUNC is not None:
             # FA4 accepts (batch, seqlen, nheads, headdim)
-            q_fa = q.transpose(1, 2)
-            k_fa = k_rep.transpose(1, 2)
-            v_fa = v_rep.transpose(1, 2)
+            q_fa = q.transpose(1, 2).contiguous()
+            k_fa = k_rep.transpose(1, 2).contiguous()
+            v_fa = v_rep.transpose(1, 2).contiguous()
             y = FA4_FUNC(q_fa, k_fa, v_fa, causal=True)
             y = y.contiguous().view(B, T, C)
 
         elif HAS_FA3 and x.is_cuda and FA3_FUNC is not None:
-            q_fa = q.transpose(1, 2)
-            k_fa = k_rep.transpose(1, 2)
-            v_fa = v_rep.transpose(1, 2)
+            q_fa = q.transpose(1, 2).contiguous()
+            k_fa = k_rep.transpose(1, 2).contiguous()
+            v_fa = v_rep.transpose(1, 2).contiguous()
             y = FA3_FUNC(q_fa, k_fa, v_fa, causal=True)
             y = y.contiguous().view(B, T, C)
 
         elif HAS_FA2 and x.is_cuda and FA2_FUNC is not None:
-            q_fa = q.transpose(1, 2)
-            k_fa = k_rep.transpose(1, 2)
-            v_fa = v_rep.transpose(1, 2)
+            q_fa = q.transpose(1, 2).contiguous()
+            k_fa = k_rep.transpose(1, 2).contiguous()
+            v_fa = v_rep.transpose(1, 2).contiguous()
             y = FA2_FUNC(q_fa, k_fa, v_fa, dropout_p=dropout_rate, causal=True)
             y = y.contiguous().view(B, T, C)
 
