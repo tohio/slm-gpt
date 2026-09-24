@@ -1,10 +1,12 @@
 """
-data/prepare_packed_curriculum.py: Physical Token Interleaving (Option 2: Direct Parquet Cache).
-Downloads a single parquet chunk per dataset locally to avoid PyArrow HTTP stream deadlocks,
-then packs tokens into standardized uint16 .bin shards.
+data/prepare_packed_curriculum.py: Physical Token Interleaving with Hybrid Parquet/JSONL Support.
+Downloads data shards locally via Hugging Face Hub to prevent stream deadlocks,
+handles both .parquet and .jsonl/.jsonl.gz sources, and packs tokens into uint16 .bin shards.
 """
 
 import glob
+import gzip
+import json
 import os
 from pathlib import Path
 import sys
@@ -35,7 +37,7 @@ class SourceReader:
 
 
 class FastParquetReader(SourceReader):
-    """Downloads one parquet file locally via HF Hub and reads batches via PyArrow."""
+    """Downloads parquet or jsonl shards locally via HF Hub and streams tokenized documents."""
     def __init__(
         self,
         name: str,
@@ -49,36 +51,40 @@ class FastParquetReader(SourceReader):
         self.subset = subset
         self.text_key = text_key
         self._local_path: Optional[str] = None
+        self._resolved: bool = False
 
     def _resolve_target_file(self, token: Optional[str]) -> Optional[str]:
         api = HfApi(token=token)
         try:
             files = api.list_repo_files(repo_id=self.repo, repo_type="dataset")
-            parquet_files = [f for f in files if f.endswith(".parquet")]
-            if not parquet_files:
+            valid_files = [f for f in files if f.endswith((".parquet", ".jsonl", ".jsonl.gz"))]
+            if not valid_files:
                 return None
 
             if self.subset:
-                subset_matches = [f for f in parquet_files if self.subset in f]
+                subset_matches = [f for f in valid_files if self.subset in f]
                 if subset_matches:
                     return subset_matches[0]
 
-            return parquet_files[0]
+            # Prefer parquet if present; otherwise fall back to jsonl
+            parquets = [f for f in valid_files if f.endswith(".parquet")]
+            return parquets[0] if parquets else valid_files[0]
         except Exception as e:
             print(f"[{self.name}] Error checking files in {self.repo}: {e}")
             return None
 
     def _ensure_local_file(self) -> Optional[str]:
-        if self._local_path and os.path.exists(self._local_path):
+        if self._resolved:
             return self._local_path
 
+        self._resolved = True
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         auth_str = " (authenticated)" if token else " (unauthenticated)"
         print(f"[{self.name}] Finding data shard in {self.repo}{auth_str}...")
 
         target_file = self._resolve_target_file(token)
         if not target_file:
-            print(f"[{self.name}] No parquet files found in repository.")
+            print(f"[{self.name}] No valid data files (.parquet, .jsonl) found in repository.")
             return None
 
         print(f"[{self.name}] Downloading shard: {target_file}")
@@ -88,39 +94,70 @@ class FastParquetReader(SourceReader):
             repo_type="dataset",
             token=token,
         )
-        print(f"[{self.name}] Cached locally: {os.path.basename(self._local_path)} ({os.path.getsize(self._local_path) / (1024 * 1024):.1f} MB)")
+        file_size_mb = os.path.getsize(self._local_path) / (1024 * 1024)
+        print(f"[{self.name}] Cached locally: {os.path.basename(self._local_path)} ({file_size_mb:.1f} MB)")
         return self._local_path
+
+    def _stream_from_jsonl(self, path: str, tokenizer) -> Iterator[List[int]]:
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    text_val = None
+                    if isinstance(data, str):
+                        text_val = data
+                    elif isinstance(data, dict):
+                        text_val = (
+                            data.get(self.text_key)
+                            or data.get("text")
+                            or data.get("content")
+                            or data.get("prompt")
+                        )
+                        if not text_val and "messages" in data and isinstance(data["messages"], list):
+                            text_val = "\n".join(
+                                f"{m.get('role', '')}: {m.get('content', '')}"
+                                for m in data["messages"]
+                                if isinstance(m, dict)
+                            )
+                    if text_val and isinstance(text_val, str) and len(text_val.strip()) > 0:
+                        yield tokenizer.encode(text_val)
+                except Exception:
+                    continue
+
+    def _stream_from_parquet(self, path: str, tokenizer) -> Iterator[List[int]]:
+        pf = pq.ParquetFile(path)
+        schema_cols = pf.schema_arrow.names
+
+        col_to_use = self.text_key if self.text_key in schema_cols else None
+        if not col_to_use:
+            for candidate in ["text", "content", "prompt"]:
+                if candidate in schema_cols:
+                    col_to_use = candidate
+                    break
+        if not col_to_use:
+            col_to_use = schema_cols[0]
+
+        for batch in pf.iter_batches(batch_size=256, columns=[col_to_use]):
+            for text_val in batch[col_to_use].to_pylist():
+                if text_val and isinstance(text_val, str) and len(text_val.strip()) > 0:
+                    yield tokenizer.encode(text_val)
 
     def stream_docs(self, tokenizer) -> Iterator[List[int]]:
         local_path = self._ensure_local_file()
         if not local_path:
-            print(f"[{self.name}] Fallback: generating synthetic curriculum docs.")
-            for i in range(5000):
-                yield tokenizer.encode(f"Synthetic document content for {self.name} sample {i}.")
             return
 
         try:
-            pf = pq.ParquetFile(local_path)
-            schema_cols = pf.schema_arrow.names
-
-            col_to_use = self.text_key if self.text_key in schema_cols else None
-            if not col_to_use:
-                for candidate in ["text", "content", "prompt"]:
-                    if candidate in schema_cols:
-                        col_to_use = candidate
-                        break
-            if not col_to_use:
-                col_to_use = schema_cols[0]
-
-            for batch in pf.iter_batches(batch_size=256, columns=[col_to_use]):
-                for text_val in batch[col_to_use].to_pylist():
-                    if text_val and isinstance(text_val, str) and len(text_val.strip()) > 0:
-                        yield tokenizer.encode(text_val)
-
+            if local_path.endswith((".jsonl", ".jsonl.gz")):
+                yield from self._stream_from_jsonl(local_path, tokenizer)
+            else:
+                yield from self._stream_from_parquet(local_path, tokenizer)
         except Exception as e:
-            print(f"[{self.name}] Error reading parquet file: {e}")
-            for i in range(5000):
-                yield tokenizer.encode(f"Fallback synthetic document for {self.name} sample {i}.")
+            print(f"[{self.name}] Error reading data file: {e}")
 
 
 class LocalBinReader(SourceReader):
@@ -174,7 +211,7 @@ def pack_curriculum_to_shards(
     target_proportions = [w / total_weight for w in raw_weights]
 
     print("=" * 70)
-    print("      slm-gpt Physical Token Packing Engine (Local Parquet Cache)")
+    print("      slm-gpt Physical Token Packing Engine (Local Parquet/JSONL Cache)")
     print("=" * 70)
     print(f"Total Train Target:  {total_token_budget:,} tokens")
     print(f"Validation Target:   {val_tokens:,} tokens")
