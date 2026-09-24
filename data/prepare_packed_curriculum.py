@@ -13,6 +13,9 @@ from typing import Any, Dict, Iterator, List, Optional
 # Ensure repository root is on sys.path regardless of execution context
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from datasets import load_dataset
 import numpy as np
 
@@ -48,12 +51,15 @@ class HFStreamReader(SourceReader):
         self.split = split
 
     def stream_docs(self, tokenizer) -> Iterator[List[int]]:
+        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         if not self._logged:
             sub_str = f" ({self.subset})" if self.subset else ""
-            print(f"[{self.name}] Connecting to stream: {self.repo}{sub_str}...")
+            auth_str = " (authenticated)" if hf_token else " (unauthenticated)"
+            print(f"[{self.name}] Connecting to stream: {self.repo}{sub_str}{auth_str}...")
             self._logged = True
+
         try:
-            kwargs = {"split": self.split, "streaming": True}
+            kwargs = {"split": self.split, "streaming": True, "token": hf_token}
             if self.subset:
                 ds = load_dataset(self.repo, self.subset, **kwargs)
             else:
@@ -147,6 +153,7 @@ def pack_curriculum_to_shards(
     print("Extracting validation partition...")
     val_buffer: List[int] = []
     source_idx = 0
+    last_log = 0
     while len(val_buffer) < val_tokens:
         try:
             doc = next(generators[source_idx % len(sources)])
@@ -156,15 +163,22 @@ def pack_curriculum_to_shards(
             generators[source_idx % len(sources)] = sources[source_idx % len(sources)].stream_docs(tokenizer)
         source_idx += 1
 
+        if len(val_buffer) - last_log >= 100_000:
+            pct = (len(val_buffer) / val_tokens) * 100
+            print(f"  [Validation] Packed {len(val_buffer):,} / {val_tokens:,} tokens ({pct:.1f}%)")
+            last_log = len(val_buffer)
+
     val_data = np.array(val_buffer[:val_tokens], dtype=np.uint16)
     val_file = os.path.join(output_dir, "val_00000.bin")
     val_data.tofile(val_file)
     print(f"✓ Wrote validation shard: {val_file} ({len(val_data):,} tokens)")
 
     # 2. Pack Training Shards
+    print("Packing training partition...")
     token_buffer: List[int] = []
     shard_idx = 0
     total_tokens_written = 0
+    last_train_log = 0
 
     while total_tokens_written + len(token_buffer) < total_token_budget:
         total_so_far = max(1, sum(tokens_per_source))
@@ -186,6 +200,12 @@ def pack_curriculum_to_shards(
         token_buffer.extend(doc_tokens)
         token_buffer.append(eot_id)
         tokens_per_source[chosen_idx] += len(doc_tokens) + 1
+
+        total_current = total_tokens_written + len(token_buffer)
+        if total_current - last_train_log >= 200_000:
+            pct = (total_current / total_token_budget) * 100
+            print(f"  [Training] Streamed {total_current:,} / {total_token_budget:,} tokens ({pct:.1f}%)")
+            last_train_log = total_current
 
         while len(token_buffer) >= shard_size_tokens:
             shard_data = np.array(token_buffer[:shard_size_tokens], dtype=np.uint16)

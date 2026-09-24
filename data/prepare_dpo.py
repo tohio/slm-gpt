@@ -13,15 +13,19 @@ Extracts prompt, chosen, and rejected completions into canonical JSONL records:
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 from typing import Any, Dict, Iterator, Optional
 
+# Ensure repository root is on sys.path regardless of execution context
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from datasets import load_dataset
 
-try:
-    from tokenizer.tiktoken_wrap import PretrainedTiktokenTokenizer
-except ImportError:
-    from tokenizer.tiktoken_tokenizer import PretrainedTiktokenTokenizer
+from tokenizer.factory import get_tokenizer
 
 
 def parse_args():
@@ -131,14 +135,17 @@ def extract_orca_record(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 
 def process_dataset(args):
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    auth_str = " (authenticated)" if hf_token else " (unauthenticated)"
+
     print(f"--- Preparing DPO Preference Dataset ---")
-    print(f"Source: {args.dataset_name} ({args.split} split)")
+    print(f"Source: {args.dataset_name} ({args.split} split){auth_str}")
     print(f"Max Samples: {args.max_samples:,} | Token Caps: prompt<={args.max_prompt_tokens}, resp<={args.max_response_tokens}")
 
-    tokenizer = PretrainedTiktokenTokenizer()
+    tokenizer = get_tokenizer("tiktoken")
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
 
-    dataset = load_dataset(args.dataset_name, split=args.split)
+    dataset = load_dataset(args.dataset_name, split=args.split, token=hf_token)
 
     valid_count = 0
     dropped_length = 0
