@@ -1,0 +1,55 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment & Credentials
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+env/
+ENV/
+
+# Model Checkpoints & Serialized Weights
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# Processed Data & Raw Datasets
+data/processed/
+data/raw/
+data/*.txt
+data/*.json
+data/*.parquet
+data/cache/
+!data/test/
+
+# Hugging Face & Cache Artefacts
+.cache/
+hf_cache/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS / OS Artefacts
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# IDE / Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
