@@ -2,17 +2,16 @@
 sft/train.py: Supervised Fine-Tuning execution engine for slm-gpt.
 
 Features:
-- Loads architecture and weights directly from pre-trained checkpoint metadata.
+- Dynamic Learning Rate Scaling across model dimensions and step budgets.
+- Special token warm-start for <|im_start|> and <|im_end|>.
 - Native mixed precision (bfloat16 / float16 GradScaler auto-dispatch).
-- Gradient accumulation with mathematically accurate step-loss telemetry.
-- Prompt loss masking (ignore_index=-100) ensuring loss is strictly on assistant tokens.
+- FlashAttention-safe qualitative generation during periodic evaluation.
+- Gradient accumulation with step-loss telemetry.
+- Strict prompt loss masking (ignore_index=-100) ensuring loss is on assistant tokens + <|im_end|>.
 - Validation perplexity evaluation loop.
-- Qualitative Multi-Prompt Inference Checks evaluated every interval.
-- Safe serialization using asdict(config) to guarantee PyTorch 2.6+ weights_only compatibility.
 """
 
 import os
-# Configure PyTorch virtual memory segments before any CUDA initialization
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from dataclasses import asdict, dataclass, fields
@@ -39,15 +38,14 @@ from sft.collator import SFTDataCollator
 from sft.dataset import IGNORE_INDEX, SFTDataset
 from tokenizer.factory import get_tokenizer
 
-# Allowlist ModelConfig for PyTorch 2.6+
 try:
     torch.serialization.add_safe_globals([ModelConfig])
 except AttributeError:
     pass
 
-
 import warnings
 warnings.filterwarnings("ignore", message=".*Argument aux_data.*cannot be converted to a JitArgument.*")
+
 
 @dataclass
 class SFTArgs:
@@ -63,8 +61,8 @@ class SFTArgs:
 
     # Optimization Hyperparameters
     per_device_batch_size: int = 16
-    gradient_accumulation_steps: int = 2  # Effective batch size = 32 dialogues
-    learning_rate: float = 2.5e-5
+    gradient_accumulation_steps: int = 2  # Effective batch size = 32
+    learning_rate: float = 0.0            # 0.0 = auto-scale dynamically
     min_lr_ratio: float = 0.1
     weight_decay: float = 0.01
     adam_beta1: float = 0.9
@@ -74,7 +72,7 @@ class SFTArgs:
     warmup_ratio: float = 0.05
     max_seq_len: int = 1024
 
-    # Runtime, Checkpointing & Qualitative Inference
+    # Runtime & Checkpointing
     eval_interval_steps: int = 50
     save_interval_epochs: int = 1
     log_interval_steps: int = 10
@@ -84,39 +82,32 @@ class SFTArgs:
 
 EVAL_PROMPTS = [
     "Hello! Who are you and what can you do?",
-    "Explain the difference between a process and a thread in one concise sentence.",
+    "What is the capital of France?",
+    "What is 2 + 2?",
     "Write a Python function to check if a word is a palindrome.",
-    "If a train travels 60 miles per hour for 2.5 hours, how far does it go?",
 ]
 
 
+def compute_dynamic_lr(d_model: int, total_steps: int) -> float:
+    """
+    Applies empirical muP scaling to calibrate peak learning rate.
+    Small models (~768 dim) need ~3.0e-4 to overcome raw pretraining priors.
+    """
+    base_lr = 3.0e-4 * (768.0 / max(d_model, 1))
+    if total_steps < 500:
+        base_lr *= 1.2
+    return round(base_lr, 7)
+
+
 def configure_precision(device: str) -> Tuple[torch.dtype, bool, Any]:
-    """Detects optimal compute dtype and scaler requirements."""
     if device == "cuda" and torch.cuda.is_bf16_supported():
-        dtype = torch.bfloat16
-        use_scaler = False
-        scaler = None
-        print("[Precision] Using Native CUDA bfloat16 (GradScaler disabled).")
+        return torch.bfloat16, False, None
     elif device == "cuda":
-        dtype = torch.float16
-        use_scaler = True
-        scaler = torch.amp.GradScaler("cuda")
-        print("[Precision] Using CUDA float16 with GradScaler.")
-    else:
-        dtype = torch.float32
-        use_scaler = False
-        scaler = None
-        print("[Precision] Using CPU float32.")
-    return dtype, use_scaler, scaler
+        return torch.float16, True, torch.amp.GradScaler("cuda")
+    return torch.float32, False, None
 
 
-def build_cosine_scheduler(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    total_steps: int,
-    min_lr_ratio: float = 0.1,
-):
-    """Cosine learning rate scheduler with linear warmup."""
+def build_cosine_scheduler(optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.1):
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
@@ -133,44 +124,42 @@ def log_sample_generations(
     model: nn.Module,
     tokenizer,
     device: str,
+    compute_dtype: torch.dtype = torch.bfloat16,
     max_new_tokens: int = 64,
 ):
-    """Executes multi-prompt qualitative inference checks with ChatML formatting."""
     model.eval()
     print("\n" + "=" * 70)
     print("                --- QUALITATIVE SFT INFERENCE CHECKS ---")
     print("=" * 70)
 
     im_end_str = "<|im_end|>"
+    use_autocast = (device == "cuda") and (compute_dtype in (torch.float16, torch.bfloat16))
 
-    for i, user_prompt in enumerate(EVAL_PROMPTS, start=1):
-        formatted_prompt = (
-            f"<|im_start|>system\nYou are a helpful, concise AI assistant.<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-        input_ids = tokenizer.encode(formatted_prompt)
-        x = torch.tensor([input_ids], dtype=torch.long, device=device)
+    with torch.amp.autocast(device_type="cuda", dtype=compute_dtype, enabled=use_autocast):
+        for i, user_prompt in enumerate(EVAL_PROMPTS, start=1):
+            formatted_prompt = f"<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
+            input_ids = tokenizer.encode(formatted_prompt)
+            x = torch.tensor([input_ids], dtype=torch.long, device=device)
 
-        out = model.generate(
-            x,
-            max_new_tokens=max_new_tokens,
-            temperature=0.6,
-            top_k=40,
-            top_p=0.9,
-            repetition_penalty=1.1,
-        )
+            out = model.generate(
+                x,
+                max_new_tokens=max_new_tokens,
+                temperature=0.6,
+                top_k=40,
+                top_p=0.9,
+                repetition_penalty=1.15,
+                eot_token_id=getattr(tokenizer, "im_end_id", 50258),
+            )
 
-        full_output = tokenizer.decode(out[0].tolist())
-        assistant_part = full_output.split("<|im_start|>assistant\n")[-1]
+            full_output = tokenizer.decode(out[0].tolist())
+            assistant_part = full_output.split("<|im_start|>assistant\n")[-1]
+            stopped_cleanly = im_end_str in assistant_part
+            clean_text = assistant_part.split(im_end_str)[0].strip()
 
-        stopped_cleanly = im_end_str in assistant_part
-        clean_text = assistant_part.split(im_end_str)[0].strip()
-
-        print(f"\n[{i}] Prompt: \"{user_prompt}\"")
-        print(f"Assistant: {clean_text}")
-        status = "✓ Stopped with <|im_end|>" if stopped_cleanly else "… (Context length cutoff)"
-        print(f"Status:    {status}")
+            print(f"\n[{i}] User:      \"{user_prompt}\"")
+            print(f"    Assistant: {clean_text}")
+            status = "✓ Stopped with <|im_end|>" if stopped_cleanly else "… (Max tokens cutoff)"
+            print(f"    Status:    {status}")
 
     print("=" * 70 + "\n")
     model.train()
@@ -183,11 +172,9 @@ def evaluate(
     compute_dtype: torch.dtype,
     max_eval_batches: int = 50,
 ) -> Tuple[float, float]:
-    """Evaluates validation loss and active token perplexity."""
     model.eval()
     total_loss = 0.0
     total_active_tokens = 0
-
     use_autocast = compute_dtype in (torch.float16, torch.bfloat16) and (device == "cuda")
 
     with torch.no_grad():
@@ -223,7 +210,6 @@ def evaluate(
 
 
 def parse_args_from_cli(args_target) -> SFTArgs:
-    """Loads default dataclass arguments and applies key=value CLI overrides safely."""
     cls = args_target if isinstance(args_target, type) else args_target.__class__
     instance = args_target if not isinstance(args_target, type) else args_target()
 
@@ -255,18 +241,14 @@ def train(args: SFTArgs):
         torch.cuda.empty_cache()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    print(f"--- Launching SFT Pipeline on {args.device.upper()} ---")
-
-    # 1. Precision configuration
     compute_dtype, use_scaler, scaler = configure_precision(args.device)
 
-    # 2. Tokenizer & Datasets
     tokenizer = get_tokenizer(args.tokenizer_type, args.tokenizer_path)
-    collator = SFTDataCollator(pad_token_id=tokenizer.eot_id, pad_to_multiple_of=16)
+    collator = SFTDataCollator(pad_token_id=tokenizer.pad_id, pad_to_multiple_of=16)
 
     assert os.path.exists(args.data_path), f"SFT dataset not found at '{args.data_path}'."
-
     train_dataset = SFTDataset(args.data_path, tokenizer=tokenizer, max_seq_len=args.max_seq_len)
+
     if args.val_path and os.path.exists(args.val_path):
         val_dataset = SFTDataset(args.val_path, tokenizer=tokenizer, max_seq_len=args.max_seq_len)
     else:
@@ -296,51 +278,58 @@ def train(args: SFTArgs):
         pin_memory=(args.device == "cuda"),
     )
 
-    # 3. Model Initialization (Restore configuration and weights)
-    assert os.path.exists(args.pretrained_ckpt), f"Pretrained checkpoint not found at: {args.pretrained_ckpt}"
+    # Model Initialization
+    assert os.path.exists(args.pretrained_ckpt), f"Pretrained checkpoint not found: '{args.pretrained_ckpt}'"
     print(f"[Weights] Loading pre-trained base from '{args.pretrained_ckpt}'")
     checkpoint = torch.load(args.pretrained_ckpt, map_location=args.device, weights_only=False)
 
     valid_fields = {f.name for f in fields(ModelConfig)}
-    if "config" in checkpoint:
-        cfg_raw = checkpoint["config"]
-        if isinstance(cfg_raw, ModelConfig):
-            cfg_dict = {f.name: getattr(cfg_raw, f.name) for f in fields(ModelConfig)}
-        elif hasattr(cfg_raw, "__dict__"):
-            cfg_dict = dict(cfg_raw.__dict__)
-        else:
-            cfg_dict = dict(cfg_raw)
-
-        filtered = {k: v for k, v in cfg_dict.items() if k in valid_fields}
-        filtered["max_seq_len"] = args.max_seq_len
-        config = ModelConfig(**filtered)
+    cfg_raw = checkpoint.get("config", {})
+    if isinstance(cfg_raw, ModelConfig):
+        cfg_dict = {f.name: getattr(cfg_raw, f.name) for f in fields(ModelConfig)}
+    elif hasattr(cfg_raw, "__dict__"):
+        cfg_dict = dict(cfg_raw.__dict__)
     else:
-        config = ModelConfig(
-            vocab_size=50304,
-            max_seq_len=args.max_seq_len,
-            d_model=768,
-            n_layers=14,
-            n_heads=12,
-            n_kv_heads=4,
-            d_ffn=2048,
-            dropout=0.0,
-            bias=False,
-            rope_theta=10000.0,
-            tie_weights=True,
-        )
+        cfg_dict = dict(cfg_raw)
+
+    filtered = {k: v for k, v in cfg_dict.items() if k in valid_fields}
+    filtered["max_seq_len"] = args.max_seq_len
+    config = ModelConfig(**filtered)
 
     model = GPT(config).to(args.device)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    state_dict = checkpoint.get("model_state_dict", checkpoint.get("model", checkpoint))
     model.load_state_dict(state_dict, strict=False)
 
-    # Guarantee weight tying
+    # Special token warm-start: Initialize newly introduced tokens from existing embedding distribution
+    with torch.no_grad():
+        im_start_id = getattr(tokenizer, "im_start_id", 50257)
+        im_end_id = getattr(tokenizer, "im_end_id", 50258)
+        base_mean = model.wte.weight[:50256].mean(dim=0)
+        base_std = model.wte.weight[:50256].std(dim=0)
+
+        for tid in (im_start_id, im_end_id):
+            if tid < model.wte.weight.size(0) and model.wte.weight[tid].norm() < 0.1:
+                model.wte.weight[tid].copy_(base_mean + torch.randn_like(base_mean) * base_std * 0.1)
+
     model.lm_head.weight = model.wte.weight
     assert model.wte.weight.data_ptr() == model.lm_head.weight.data_ptr(), "Weight tying broken!"
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[Architecture] Initialized {config.n_layers} layers, {total_params:,} parameters ({total_params/1e6:.2f}M).")
 
-    # 4. Optimizer & Schedule
+    # Optimizer & Schedule
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / max(1, args.gradient_accumulation_steps)))
+    total_training_steps = max(1, steps_per_epoch * args.epochs)
+    warmup_steps = int(total_training_steps * args.warmup_ratio)
+
+    # Dynamic Learning Rate Resolution
+    if args.learning_rate <= 0.0 or args.learning_rate == 2.5e-5:
+        effective_lr = compute_dynamic_lr(config.d_model, total_training_steps)
+        print(f"[Optimization] Dynamically scaled Peak Learning Rate: {effective_lr:.2e} (based on d_model={config.d_model})")
+    else:
+        effective_lr = args.learning_rate
+        print(f"[Optimization] Using user-specified Peak Learning Rate: {effective_lr:.2e}")
+
     decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
     nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
     optim_groups = [
@@ -349,14 +338,10 @@ def train(args: SFTArgs):
     ]
     optimizer = torch.optim.AdamW(
         optim_groups,
-        lr=args.learning_rate,
+        lr=effective_lr,
         betas=(args.adam_beta1, args.adam_beta2),
         fused=(args.device == "cuda"),
     )
-
-    steps_per_epoch = max(1, math.ceil(len(train_loader) / max(1, args.gradient_accumulation_steps)))
-    total_training_steps = max(1, steps_per_epoch * args.epochs)
-    warmup_steps = int(total_training_steps * args.warmup_ratio)
 
     scheduler = build_cosine_scheduler(
         optimizer,
@@ -372,7 +357,7 @@ def train(args: SFTArgs):
     print(f"Warmup Steps:          {warmup_steps}")
     print("-" * 65)
 
-    # 5. Training Loop
+    # Training Loop
     global_step = 0
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -439,7 +424,7 @@ def train(args: SFTArgs):
                 if global_step % args.eval_interval_steps == 0:
                     val_loss, val_ppl = evaluate(model, val_loader, args.device, compute_dtype)
                     print(f"\n--> [Eval @ Step {global_step}] Val Loss: {val_loss:.4f} | Perplexity: {val_ppl:.2f}")
-                    log_sample_generations(model, tokenizer, args.device)
+                    log_sample_generations(model, tokenizer, args.device, compute_dtype)
 
         epoch_duration = time.time() - epoch_start_time
         print(f"Epoch {epoch + 1} completed in {epoch_duration:.2f}s")
@@ -460,7 +445,6 @@ def train(args: SFTArgs):
             )
             print(f"[Checkpoint] Saved model snapshot to: {save_path}")
 
-    # Final policy checkpoint
     final_path = os.path.join(args.output_dir, "sft_final.pt")
     torch.save(
         {
