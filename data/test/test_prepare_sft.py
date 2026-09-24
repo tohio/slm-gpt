@@ -12,11 +12,12 @@ import pytest
 # Ensure repository root is on sys.path
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from data.prepare_sft_dataset import (
+from data.prepare_sft import (
     extract_python_snippet,
     is_valid_python,
     sanitize_technical_response,
 )
+
 from tokenizer.tiktoken_wrap import PretrainedTiktokenTokenizer
 
 
