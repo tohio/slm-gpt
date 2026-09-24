@@ -34,13 +34,12 @@ class PipelineConfig:
     tokenizer_path: Optional[str] = None
     num_gpus: Optional[int] = None
     micro_batch_size: Optional[int] = None  # Explicit CLI override support
-    resume_from: Optional[str] = None  # None, "sft", or "dpo"
+    resume_from: Optional[str] = None       # None, "sft", or "dpo"
 
     # Stage Data Paths
     pretrain_data_dir: str = "data/pretrain"
     sft_data_path: str = "data/sft/train.jsonl"
     dpo_data_path: str = "data/dpo/preference_pairs.jsonl"
-    dpo_dataset: Optional[str] = "argilla/dpo-mix-7k"  # Verified default preference dataset
 
     # Stage 0 Data Budgets (Used if data is missing on cold-start)
     bootstrap_pretrain_tokens: int = 10_000_000
@@ -183,17 +182,15 @@ class PipelineOrchestrator:
         else:
             print(f"✓ Pre-training shards verified in '{self.cfg.pretrain_data_dir}'")
 
-        # 0B. SFT Dialogue Check
+        # 0B. SFT Dialogue Check (Composite Local Ingestion)
         if not os.path.exists(self.cfg.sft_data_path) and self.cfg.resume_from != "dpo":
-            print(f"⚠️ SFT dataset missing at '{self.cfg.sft_data_path}'. Ingesting SmolTalk...")
+            print(f"⚠️ SFT dataset missing at '{self.cfg.sft_data_path}'. Executing composite harvest...")
             out_dir = os.path.dirname(self.cfg.sft_data_path) or "data/sft"
             cmd = [
                 sys.executable,
                 "-m", "data.prepare_sft",
-                "--source=HuggingFaceTB/smoltalk",
-                "--config=all",
-                f"--output_dir={out_dir}",
-                f"--max_samples={self.cfg.bootstrap_sft_samples}",
+                f"output_dir={out_dir}",
+                f"total_samples={self.cfg.bootstrap_sft_samples}",
             ]
             ret = subprocess.run(cmd)
             if ret.returncode != 0:
@@ -201,50 +198,32 @@ class PipelineOrchestrator:
         else:
             print(f"✓ SFT dataset verified at '{self.cfg.sft_data_path}'")
 
-        # 0C. DPO Preference Check
-        dpo_target = self.cfg.dpo_dataset or self.cfg.dpo_data_path
-        is_remote = ("/" in dpo_target and not os.path.exists(dpo_target))
+        # 0C. DPO Preference Check (Composite Local Ingestion)
+        dpo_missing = not os.path.exists(self.cfg.dpo_data_path)
+        dpo_stub = False
+        if not dpo_missing:
+            # Stub check: less than 50KB means mock or tiny bootstrap stub
+            size_bytes = os.path.getsize(self.cfg.dpo_data_path)
+            if size_bytes < 50_000:
+                dpo_stub = True
 
-        if not is_remote:
-            dpo_missing = not os.path.exists(self.cfg.dpo_data_path)
-            dpo_stub = False
-            if not dpo_missing:
-                # Stub check: less than 50KB means mock or tiny bootstrap stub
-                size_bytes = os.path.getsize(self.cfg.dpo_data_path)
-                if size_bytes < 50_000:
-                    dpo_stub = True
+        if dpo_missing or dpo_stub:
+            reason = "missing" if dpo_missing else "minimal smoke stub (<50KB)"
+            print(f"⚠️ DPO dataset at '{self.cfg.dpo_data_path}' is {reason}. Executing composite harvest...")
+            out_dir = os.path.dirname(self.cfg.dpo_data_path) or "data/dpo"
+            os.makedirs(out_dir, exist_ok=True)
 
-            if dpo_missing or dpo_stub:
-                reason = "missing" if dpo_missing else "minimal smoke stub (<50KB)"
-                print(f"⚠️ DPO dataset at '{self.cfg.dpo_data_path}' is {reason}. Ingesting preference pairs...")
-                out_dir = os.path.dirname(self.cfg.dpo_data_path) or "data/dpo"
-                os.makedirs(out_dir, exist_ok=True)
-
-                prep_script = Path(REPO_ROOT) / "data" / "prepare_dpo.py"
-                if prep_script.exists():
-                    cmd = [
-                        sys.executable,
-                        "-m", "data.prepare_dpo",
-                        "--dataset_name=argilla/dpo-mix-7k",
-                        f"--output_path={self.cfg.dpo_data_path}",
-                        f"--max_samples={self.cfg.bootstrap_dpo_samples}",
-                    ]
-                    ret = subprocess.run(cmd)
-                    if ret.returncode != 0:
-                        raise RuntimeError("Stage 0: DPO dataset preparation failed.")
-                else:
-                    try:
-                        from datasets import load_dataset
-                        print("   Downloading 'argilla/dpo-mix-7k' from Hugging Face Hub...")
-                        ds = load_dataset("argilla/dpo-mix-7k", split="train")
-                        ds.to_json(self.cfg.dpo_data_path, orient="records", lines=True)
-                        print(f"✓ Ingested {len(ds):,} pairs into '{self.cfg.dpo_data_path}'")
-                    except Exception as e:
-                        print(f"[Warning] Could not pre-download DPO dataset: {e}")
-            else:
-                print(f"✓ DPO dataset verified at '{self.cfg.dpo_data_path}'")
+            cmd = [
+                sys.executable,
+                "-m", "data.prepare_dpo",
+                f"output_path={self.cfg.dpo_data_path}",
+                f"total_samples={self.cfg.bootstrap_dpo_samples}",
+            ]
+            ret = subprocess.run(cmd)
+            if ret.returncode != 0:
+                raise RuntimeError("Stage 0: DPO composite dataset preparation failed.")
         else:
-            print(f"✓ DPO remote dataset configured: '{dpo_target}' (will stream directly in Stage 3)")
+            print(f"✓ DPO composite dataset verified at '{self.cfg.dpo_data_path}'")
 
     def run_pretrain(self):
         pretrain_title = (
@@ -318,14 +297,13 @@ class PipelineOrchestrator:
             raise FileNotFoundError(f"Reference SFT checkpoint required for DPO not found: '{self.sft_ckpt}'")
 
         dpo_batch = max(1, min(8, self.auto_micro_batch // 2))
-        target_dataset = self.cfg.dpo_dataset if self.cfg.dpo_dataset else self.cfg.dpo_data_path
 
         cmd = [
             sys.executable,
             "-m", "dpo.train",
             f"sft_model_path={self.sft_ckpt}",
             f"output_dir=checkpoints/dpo_{self.size_tag}",
-            f"data_path={target_dataset}",
+            f"data_path={self.cfg.dpo_data_path}",
             f"epochs={self.cfg.dpo_epochs}",
             f"learning_rate={self.cfg.dpo_learning_rate}",
             f"tokenizer_type={self.cfg.tokenizer_type}",

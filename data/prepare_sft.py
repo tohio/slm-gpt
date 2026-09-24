@@ -240,8 +240,8 @@ def prepare_sft_splits(
     val_set = dataset[:n_val]
     train_set = dataset[n_val:]
 
-    train_path = os.path.join(output_dir, "train_sft.jsonl")
-    val_path = os.path.join(output_dir, "val_sft.jsonl")
+    train_path = os.path.join(output_dir, "train.jsonl")
+    val_path = os.path.join(output_dir, "val.jsonl")
 
     with open(train_path, "w", encoding="utf-8") as f:
         for s in train_set:
