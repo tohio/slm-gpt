@@ -34,7 +34,7 @@ class SourceReader:
 
 
 class HFStreamReader(SourceReader):
-    """Streams and tokenizes raw documents on-the-fly from Hugging Face."""
+    """Streams and tokenizes raw documents in buffered chunks from Hugging Face."""
     def __init__(
         self,
         name: str,
@@ -43,12 +43,14 @@ class HFStreamReader(SourceReader):
         text_key: str,
         weight: float,
         split: str = "train",
+        doc_buffer_size: int = 128,
     ):
         super().__init__(name, weight)
         self.repo = repo
         self.subset = subset
         self.text_key = text_key
         self.split = split
+        self.doc_buffer_size = doc_buffer_size
 
     def stream_docs(self, tokenizer) -> Iterator[List[int]]:
         hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
@@ -65,6 +67,7 @@ class HFStreamReader(SourceReader):
             else:
                 ds = load_dataset(self.repo, **kwargs)
 
+            batch_texts = []
             for item in ds:
                 text = (
                     item.get(self.text_key)
@@ -73,7 +76,16 @@ class HFStreamReader(SourceReader):
                     or ""
                 )
                 if text and len(text.strip()) > 0:
-                    yield tokenizer.encode(text)
+                    batch_texts.append(text)
+
+                if len(batch_texts) >= self.doc_buffer_size:
+                    for t in batch_texts:
+                        yield tokenizer.encode(t)
+                    batch_texts.clear()
+
+            for t in batch_texts:
+                yield tokenizer.encode(t)
+
         except Exception as e:
             if not self._logged:
                 print(f"[{self.name}] Error connecting to {self.repo}: {e}")
@@ -118,7 +130,7 @@ def pack_curriculum_to_shards(
     output_dir: str = "data/pretrain",
     total_token_budget: int = 100_000_000,
     shard_size_tokens: int = 25_000_000,
-    val_tokens: int = 500_000,
+    val_tokens: Optional[int] = None,
     tokenizer_type: str = "tiktoken",
     tokenizer_path: Optional[str] = None,
 ):
@@ -129,6 +141,10 @@ def pack_curriculum_to_shards(
     os.makedirs(output_dir, exist_ok=True)
     tokenizer = get_tokenizer(tokenizer_type, tokenizer_path)
     eot_id = tokenizer.eot_id
+
+    # Dynamically scale validation tokens: 5% of total budget (min 10k, max 500k)
+    if val_tokens is None:
+        val_tokens = max(10_000, min(500_000, total_token_budget // 20))
 
     raw_weights = [s.weight for s in sources]
     total_weight = sum(raw_weights)
@@ -153,7 +169,7 @@ def pack_curriculum_to_shards(
     print("Extracting validation partition...")
     val_buffer: List[int] = []
     source_idx = 0
-    last_log = 0
+    last_val_log = 0
     while len(val_buffer) < val_tokens:
         try:
             doc = next(generators[source_idx % len(sources)])
@@ -163,10 +179,10 @@ def pack_curriculum_to_shards(
             generators[source_idx % len(sources)] = sources[source_idx % len(sources)].stream_docs(tokenizer)
         source_idx += 1
 
-        if len(val_buffer) - last_log >= 100_000:
+        if len(val_buffer) - last_val_log >= max(5_000, val_tokens // 5):
             pct = (len(val_buffer) / val_tokens) * 100
             print(f"  [Validation] Packed {len(val_buffer):,} / {val_tokens:,} tokens ({pct:.1f}%)")
-            last_log = len(val_buffer)
+            last_val_log = len(val_buffer)
 
     val_data = np.array(val_buffer[:val_tokens], dtype=np.uint16)
     val_file = os.path.join(output_dir, "val_00000.bin")
@@ -202,7 +218,7 @@ def pack_curriculum_to_shards(
         tokens_per_source[chosen_idx] += len(doc_tokens) + 1
 
         total_current = total_tokens_written + len(token_buffer)
-        if total_current - last_train_log >= 200_000:
+        if total_current - last_train_log >= max(20_000, total_token_budget // 10):
             pct = (total_current / total_token_budget) * 100
             print(f"  [Training] Streamed {total_current:,} / {total_token_budget:,} tokens ({pct:.1f}%)")
             last_train_log = total_current
@@ -254,6 +270,7 @@ if __name__ == "__main__":
     tokens_target = 100_000_000
     custom_dir = None
     target_out = "data/pretrain"
+    val_budget = None
 
     for arg in sys.argv[1:]:
         if arg.startswith("total_tokens="):
@@ -262,10 +279,13 @@ if __name__ == "__main__":
             custom_dir = arg.split("=")[1]
         elif arg.startswith("output_dir="):
             target_out = arg.split("=")[1]
+        elif arg.startswith("val_tokens="):
+            val_budget = int(arg.split("=")[1])
 
     curriculum = build_default_curriculum(upstream_dir=custom_dir)
     pack_curriculum_to_shards(
         sources=curriculum,
         output_dir=target_out,
         total_token_budget=tokens_target,
+        val_tokens=val_budget,
     )
