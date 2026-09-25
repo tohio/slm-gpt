@@ -1,8 +1,9 @@
 """
-data/prepare_sft.py: 4-Pillar Composite SFT Dataset Assembler for slm-gpt.
+data/prepare_sft.py: 5-Pillar Composite SFT Dataset Assembler for slm-gpt.
 Harvests Code (Magicoder), Reasoning with <think> (OpenR1-Math), Constraints,
-and Dialogue (SmolTalk), performs strict forward-compatible AST validation,
-strips preambles/postambles, and outputs standardized train.jsonl and val.jsonl datasets.
+Dialogue (SmolTalk), and Synthetic SFT (tohio/slm-synthetic-sft), performs strict
+forward-compatible AST validation, strips preambles/postambles, and outputs
+standardized train.jsonl and val.jsonl datasets.
 """
 
 import ast
@@ -96,7 +97,7 @@ def sanitize_technical_response_postambles(text: str) -> str:
 
 def harvest_code_samples(budget: int) -> List[Dict[str, Any]]:
     """Harvests Python programming tasks from ise-uiuc/Magicoder-OSS-Instruct-75K."""
-    print(f"\n[1/4] Harvesting {budget:,} Code Execution samples (local cache)...")
+    print(f"\n[1/5] Harvesting {budget:,} Code Execution samples (local cache)...")
     samples: List[Dict[str, Any]] = []
     try:
         from datasets import load_dataset
@@ -149,7 +150,7 @@ def harvest_code_samples(budget: int) -> List[Dict[str, Any]]:
 
 def harvest_reasoning_samples(budget: int) -> List[Dict[str, Any]]:
     """Harvests step-by-step reasoning samples with <think> tags."""
-    print(f"\n[2/4] Harvesting {budget:,} Math/Reasoning samples with <think> (local cache)...")
+    print(f"\n[2/5] Harvesting {budget:,} Math/Reasoning samples with <think> (local cache)...")
     samples: List[Dict[str, Any]] = []
     try:
         from datasets import load_dataset
@@ -187,7 +188,7 @@ def harvest_reasoning_samples(budget: int) -> List[Dict[str, Any]]:
 
 def harvest_constraint_samples(budget: int) -> List[Dict[str, Any]]:
     """Harvests rule-following constraint samples from SmolTalk."""
-    print(f"\n[3/4] Harvesting {budget:,} Constraint Task samples (local cache)...")
+    print(f"\n[3/5] Harvesting {budget:,} Constraint Task samples (local cache)...")
     samples: List[Dict[str, Any]] = []
     try:
         from datasets import load_dataset
@@ -208,7 +209,7 @@ def harvest_constraint_samples(budget: int) -> List[Dict[str, Any]]:
 
 def harvest_chitchat_samples(budget: int) -> List[Dict[str, Any]]:
     """Harvests multi-turn conversational dialogue from SmolTalk."""
-    print(f"\n[4/4] Harvesting {budget:,} Chit-Chat samples (local cache)...")
+    print(f"\n[4/5] Harvesting {budget:,} Chit-Chat samples (local cache)...")
     samples: List[Dict[str, Any]] = []
     try:
         from datasets import load_dataset
@@ -227,27 +228,76 @@ def harvest_chitchat_samples(budget: int) -> List[Dict[str, Any]]:
     return samples
 
 
+def harvest_synthetic_sft_samples(budget: int) -> List[Dict[str, Any]]:
+    """Harvests synthetic instruction and dialogue samples from tohio/slm-synthetic-sft."""
+    print(f"\n[5/5] Harvesting {budget:,} Synthetic SFT samples (local cache)...")
+    samples: List[Dict[str, Any]] = []
+    try:
+        from datasets import load_dataset
+
+        ds = load_dataset("tohio/slm-synthetic-sft", split="train", token=HF_TOKEN)
+        for row in ds:
+            msgs = row.get("messages")
+            if msgs and isinstance(msgs, list) and len(msgs) >= 2:
+                samples.append({"messages": msgs})
+            else:
+                prob = (
+                    row.get("instruction")
+                    or row.get("problem")
+                    or row.get("prompt")
+                    or ""
+                ).strip()
+                sol = (
+                    row.get("response")
+                    or row.get("solution")
+                    or row.get("answer")
+                    or row.get("completion")
+                    or ""
+                ).strip()
+
+                if prob and sol:
+                    samples.append(
+                        {
+                            "messages": [
+                                {"role": "user", "content": prob},
+                                {"role": "assistant", "content": sol},
+                            ]
+                        }
+                    )
+            if len(samples) >= budget:
+                break
+    except Exception as e:
+        print(f"  ⚠️ Warning: Synthetic SFT harvest encountered an issue: {e}")
+
+    print(f"  ✓ Collected {len(samples):,} synthetic SFT samples.")
+    return samples
+
+
 def prepare_sft_splits(total_samples: int = 15_000, output_dir: str = "data/sft"):
     """Coordinates composite collection, shuffles, and writes train.jsonl and val.jsonl."""
     print("=" * 70)
-    print("   slm-gpt SFT 4-Pillar Dataset Assembler (Local Parquet Engine)")
+    print("   slm-gpt SFT 5-Pillar Dataset Assembler (Local Parquet Engine)")
     print("=" * 70)
     print(f"Target Budget: {total_samples:,} samples")
     print(f"Auth Token:    {'✓ Detected' if HF_TOKEN else '⚠️ Not Found (Falling back to unauthenticated)'}")
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 4-Pillar distribution: 30% code, 30% reasoning, 25% constraints, 15% chit-chat
-    budget_code = int(total_samples * 0.30)
-    budget_reasoning = int(total_samples * 0.30)
-    budget_constraints = int(total_samples * 0.25)
-    budget_chitchat = total_samples - (budget_code + budget_reasoning + budget_constraints)
+    # 5-Pillar distribution: 25% code, 25% reasoning, 20% constraints, 15% synthetic, 15% chit-chat
+    budget_code = int(total_samples * 0.25)
+    budget_reasoning = int(total_samples * 0.25)
+    budget_constraints = int(total_samples * 0.20)
+    budget_synthetic = int(total_samples * 0.15)
+    budget_chitchat = total_samples - (
+        budget_code + budget_reasoning + budget_constraints + budget_synthetic
+    )
 
     dataset: List[Dict[str, Any]] = []
     dataset.extend(harvest_code_samples(budget_code))
     dataset.extend(harvest_reasoning_samples(budget_reasoning))
     dataset.extend(harvest_constraint_samples(budget_constraints))
     dataset.extend(harvest_chitchat_samples(budget_chitchat))
+    dataset.extend(harvest_synthetic_sft_samples(budget_synthetic))
 
     random.seed(42)
     random.shuffle(dataset)

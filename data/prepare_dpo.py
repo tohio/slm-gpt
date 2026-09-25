@@ -1,15 +1,16 @@
 """
 data/prepare_dpo.py: Preference Pair Harvester & Normalizer for DPO.
-Harvests multi-turn conversational preferences from allenai/llama-3.1-tulu-3-8b-preference-mixture,
-filters identical completions and length/verbosity exploits, authenticates via HF_TOKEN,
-and persists standardized preference pairs to JSONL.
+Harvests multi-turn conversational preferences from allenai/llama-3.1-tulu-3-8b-preference-mixture
+and tohio/slm-synthetic-dpo, filters identical completions and length/verbosity exploits,
+authenticates via HF_TOKEN, and persists standardized preference pairs to JSONL.
 """
 
 import json
 import os
 from pathlib import Path
+import random
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Ensure repository root is on sys.path regardless of execution context
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,6 +19,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+
+TULU_DATASET = "allenai/llama-3.1-tulu-3-8b-preference-mixture"
+SYNTHETIC_DATASET = "tohio/slm-synthetic-dpo"
 
 
 def normalize_preference_record(sample: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -65,7 +69,11 @@ def normalize_preference_record(sample: Dict[str, Any]) -> Optional[Dict[str, st
     # 2. Flat string completion fallback
     else:
         if not prompt_text:
-            prompt_text = str(sample.get("prompt", "") or sample.get("question", "")).strip()
+            prompt_text = str(
+                sample.get("prompt", "")
+                or sample.get("question", "")
+                or sample.get("instruction", "")
+            ).strip()
         chosen_text = str(sample.get("chosen", "")).strip()
         rejected_text = str(sample.get("rejected", "")).strip()
 
@@ -100,40 +108,76 @@ def normalize_preference_record(sample: Dict[str, Any]) -> Optional[Dict[str, st
     return record
 
 
+def harvest_dataset_records(dataset_name: str, budget: int) -> Tuple[List[Dict[str, str]], int]:
+    """Streams and normalizes up to `budget` valid records from a Hugging Face dataset."""
+    from datasets import load_dataset
+
+    print(f"Loading '{dataset_name}' (target: {budget:,} pairs)...")
+    valid_records: List[Dict[str, str]] = []
+    skipped = 0
+
+    try:
+        ds = load_dataset(dataset_name, split="train", token=HF_TOKEN, streaming=True)
+        for row in ds:
+            norm = normalize_preference_record(row)
+            if norm is not None:
+                valid_records.append(norm)
+                if len(valid_records) >= budget:
+                    break
+            else:
+                skipped += 1
+    except Exception as e:
+        print(f"  ⚠️ Warning loading {dataset_name}: {e}")
+
+    print(f"  ✓ Collected {len(valid_records):,} pairs from {dataset_name} ({skipped:,} filtered)")
+    return valid_records, skipped
+
+
 def prepare_dpo_dataset(
     output_path: str = "data/dpo/preference_pairs.jsonl",
-    dataset_name: str = "allenai/llama-3.1-tulu-3-8b-preference-mixture",
     total_samples: int = 7_000,
+    synthetic_ratio: float = 0.30,
+    dataset_name: Optional[str] = None,
 ):
-    """Harvests and normalizes preference pairs from Hugging Face Hub or local cache."""
+    """Harvests, mixes, and normalizes preference pairs into JSONL."""
     print("=" * 70)
     print("      slm-gpt DPO Preference Pair Assembler (Offline Engine)       ")
     print("=" * 70)
-    print(f"Target Budget: {total_samples:,} pairs")
-    print(f"Source:        {dataset_name}")
-    print(f"Output:        {output_path}")
-    print(f"Auth Token:    {'✓ Detected' if HF_TOKEN else '⚠️ Not Found (Falling back to unauthenticated)'}")
+    print(f"Target Budget:   {total_samples:,} pairs")
+    print(f"Output:          {output_path}")
+    print(f"Auth Token:      {'✓ Detected' if HF_TOKEN else '⚠️ Not Found (Falling back to unauthenticated)'}")
 
     out_dir = os.path.dirname(output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    from datasets import load_dataset
-
-    print(f"Loading '{dataset_name}' from cache/Hub...")
-    ds = load_dataset(dataset_name, split="train", token=HF_TOKEN)
-
     valid_records: List[Dict[str, str]] = []
-    skipped = 0
+    total_skipped = 0
 
-    for row in ds:
-        norm = normalize_preference_record(row)
-        if norm is not None:
-            valid_records.append(norm)
-            if len(valid_records) >= total_samples:
-                break
-        else:
-            skipped += 1
+    # If user explicitly overrode with a single dataset name, harvest solely from that source
+    if dataset_name:
+        records, skipped = harvest_dataset_records(dataset_name, total_samples)
+        valid_records.extend(records)
+        total_skipped += skipped
+    else:
+        # Default dual-mix: (1 - synthetic_ratio) Tulu-3 + (synthetic_ratio) slm-synthetic-dpo
+        budget_synthetic = int(total_samples * synthetic_ratio)
+        budget_tulu = total_samples - budget_synthetic
+
+        print(f"Strategy:        Composite ({100 - int(synthetic_ratio * 100)}% Tulu / {int(synthetic_ratio * 100)}% Synthetic)")
+        print("-" * 70)
+
+        tulu_records, tulu_skipped = harvest_dataset_records(TULU_DATASET, budget_tulu)
+        valid_records.extend(tulu_records)
+        total_skipped += tulu_skipped
+
+        synth_records, synth_skipped = harvest_dataset_records(SYNTHETIC_DATASET, budget_synthetic)
+        valid_records.extend(synth_records)
+        total_skipped += synth_skipped
+
+    # Shuffle composite mixture
+    random.seed(42)
+    random.shuffle(valid_records)
 
     with open(output_path, "w", encoding="utf-8") as f:
         for rec in valid_records:
@@ -143,7 +187,7 @@ def prepare_dpo_dataset(
     print("✓ Successfully assembled DPO preference dataset:")
     print(f"  Path:       {output_path}")
     print(f"  Kept:       {len(valid_records):,} pairs")
-    print(f"  Filtered:   {skipped:,} pairs (identical / length exploit)")
+    print(f"  Filtered:   {total_skipped:,} pairs (identical / length exploit)")
     print("=" * 70)
 
 
@@ -151,8 +195,9 @@ def parse_cli_args() -> Dict[str, Any]:
     """Flexible CLI parser supporting both key=value and standard flag arguments."""
     kwargs: Dict[str, Any] = {
         "output_path": "data/dpo/preference_pairs.jsonl",
-        "dataset_name": "allenai/llama-3.1-tulu-3-8b-preference-mixture",
         "total_samples": 7_000,
+        "synthetic_ratio": 0.30,
+        "dataset_name": None,
     }
 
     args = sys.argv[1:]
@@ -168,6 +213,8 @@ def parse_cli_args() -> Dict[str, Any]:
                 kwargs["output_path"] = v
             elif k in ("dataset_name", "source"):
                 kwargs["dataset_name"] = v
+            elif k in ("synthetic_ratio", "ratio"):
+                kwargs["synthetic_ratio"] = float(v)
         elif arg in ("--output_path", "-o"):
             i += 1
             if i < len(args):
@@ -180,6 +227,10 @@ def parse_cli_args() -> Dict[str, Any]:
             i += 1
             if i < len(args):
                 kwargs["dataset_name"] = args[i]
+        elif arg in ("--synthetic_ratio", "-r"):
+            i += 1
+            if i < len(args):
+                kwargs["synthetic_ratio"] = float(args[i])
         elif arg.isdigit():
             kwargs["total_samples"] = int(arg)
         i += 1
