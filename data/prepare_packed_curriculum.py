@@ -26,6 +26,63 @@ import pyarrow.parquet as pq
 from tokenizer.factory import get_tokenizer
 
 
+# =====================================================================
+# Dynamic Curriculum Weight & Repetition Capping
+# =====================================================================
+
+BASE_RATIOS = {
+    "FineWeb-Edu": 0.480,
+    "DCLM-Edu": 0.250,
+    "The Stack-Edu": 0.150,
+    "NuminaMath-CoT": 0.050,
+    "OpenMathReasoning": 0.040,
+    "SLM-Synthetic-Pretrain": 0.030,
+}
+
+FINITE_POOLS = {
+    "NuminaMath-CoT": 220_000_000,
+    "OpenMathReasoning": 200_000_000,
+    "SLM-Synthetic-Pretrain": 250_000_000,
+}
+
+INFINITE_SOURCES = ["FineWeb-Edu", "DCLM-Edu", "The Stack-Edu"]
+
+
+def compute_curriculum_weights(total_tokens: int, param_count: int) -> Dict[str, float]:
+    """
+    Calculates source weights based on total_tokens budget and enforces safe
+    repetition ceilings on finite pools according to model capacity.
+    Excess tokens naturally spill into infinite web/code streams.
+    """
+    if param_count < 200_000_000:
+        max_epochs = {"NuminaMath-CoT": 2.0, "OpenMathReasoning": 2.0, "SLM-Synthetic-Pretrain": 1.5}
+    elif param_count <= 600_000_000:
+        max_epochs = {"NuminaMath-CoT": 3.2, "OpenMathReasoning": 3.0, "SLM-Synthetic-Pretrain": 1.8}
+    else:
+        max_epochs = {"NuminaMath-CoT": 2.5, "OpenMathReasoning": 2.5, "SLM-Synthetic-Pretrain": 2.0}
+
+    # 1. Cap finite datasets
+    finite_tokens = {}
+    for name, pool in FINITE_POOLS.items():
+        desired = int(total_tokens * BASE_RATIOS[name])
+        ceiling = int(pool * max_epochs[name])
+        finite_tokens[name] = min(desired, ceiling)
+
+    # 2. Spill remainder proportionally across infinite streams
+    rem_tokens = total_tokens - sum(finite_tokens.values())
+    inf_sum = sum(BASE_RATIOS[name] for name in INFINITE_SOURCES)
+
+    weights = {}
+    for name, count in finite_tokens.items():
+        weights[name] = count / total_tokens
+
+    for name in INFINITE_SOURCES:
+        share = (BASE_RATIOS[name] / inf_sum) * rem_tokens
+        weights[name] = share / total_tokens
+
+    return weights
+
+
 class SourceReader:
     """Base reader interface for curriculum sources."""
     def __init__(self, name: str, weight: float):
@@ -363,25 +420,32 @@ def pack_curriculum_to_shards(
     print("=" * 75)
 
 
-def build_default_curriculum(upstream_dir: Optional[str] = None) -> List[SourceReader]:
+def build_default_curriculum(
+    total_tokens: int = 2_000_000_000,
+    param_count: int = 126_758_400,
+    upstream_dir: Optional[str] = None
+) -> List[SourceReader]:
     if upstream_dir and os.path.exists(upstream_dir):
         return [
             LocalBinReader("Local Curated Shards", upstream_dir, weight=0.98, eot_token_id=50256, dtype=np.uint16),
             FastParquetReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=0.02),
         ]
 
+    w = compute_curriculum_weights(total_tokens=total_tokens, param_count=param_count)
+
     return [
-        FastParquetReader("FineWeb-Edu", "HuggingFaceFW/fineweb-edu", "sample/10BT", "text", weight=0.45),
-        FastParquetReader("DCLM-Edu", "HuggingFaceTB/dclm-edu", None, "text", weight=0.23),
-        FastParquetReader("The Stack-Edu", "HuggingFaceTB/smollm-corpus", "python-edu", "content", weight=0.10),
-        ReasoningParquetReader("OpenMathReasoning", "nvidia/OpenMathReasoning", None, "problem", "generated_solution", weight=0.09, wrap_think_tag=False),
-        ReasoningParquetReader("NuminaMath-CoT", "AI-MO/NuminaMath-CoT", None, "problem", "solution", weight=0.08, wrap_think_tag=True),
-        FastParquetReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=0.05),
+        FastParquetReader("FineWeb-Edu", "HuggingFaceFW/fineweb-edu", "sample/10BT", "text", weight=w["FineWeb-Edu"]),
+        FastParquetReader("DCLM-Edu", "HuggingFaceTB/dclm-edu", None, "text", weight=w["DCLM-Edu"]),
+        FastParquetReader("The Stack-Edu", "HuggingFaceTB/smollm-corpus", "python-edu", "content", weight=w["The Stack-Edu"]),
+        ReasoningParquetReader("OpenMathReasoning", "nvidia/OpenMathReasoning", None, "problem", "generated_solution", weight=w["OpenMathReasoning"], wrap_think_tag=False),
+        ReasoningParquetReader("NuminaMath-CoT", "AI-MO/NuminaMath-CoT", None, "problem", "solution", weight=w["NuminaMath-CoT"], wrap_think_tag=True),
+        FastParquetReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=w["SLM-Synthetic-Pretrain"]),
     ]
 
 
 if __name__ == "__main__":
     tokens_target = 2_000_000_000
+    param_target = 126_758_400
     custom_dir = None
     target_out = "data/pretrain"
     val_budget = None
@@ -389,6 +453,8 @@ if __name__ == "__main__":
     for arg in sys.argv[1:]:
         if arg.startswith("total_tokens="):
             tokens_target = int(arg.split("=")[1])
+        elif arg.startswith("params=") or arg.startswith("param_count="):
+            param_target = int(arg.split("=")[1])
         elif arg.startswith("upstream_dir="):
             custom_dir = arg.split("=")[1]
         elif arg.startswith("output_dir="):
@@ -396,7 +462,12 @@ if __name__ == "__main__":
         elif arg.startswith("val_tokens="):
             val_budget = int(arg.split("=")[1])
 
-    curriculum = build_default_curriculum(upstream_dir=custom_dir)
+    curriculum = build_default_curriculum(
+        total_tokens=tokens_target,
+        param_count=param_target,
+        upstream_dir=custom_dir,
+    )
+
     pack_curriculum_to_shards(
         sources=curriculum,
         output_dir=target_out,
