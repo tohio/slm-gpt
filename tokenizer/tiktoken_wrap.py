@@ -3,7 +3,7 @@ tokenizer/tiktoken_wrap.py: Pretrained tiktoken wrapper with first-class special
 for ChatML, reasoning chains (<think>), tool calling, and FIM code infilling.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Union
 import tiktoken
 from .base import BaseTokenizer
 
@@ -52,6 +52,10 @@ class PretrainedTiktokenTokenizer(BaseTokenizer):
             mergeable_ranks=base_enc._mergeable_ranks,
             special_tokens=self.special_tokens,
         )
+
+        # Cache valid token IDs recognized by the underlying BPE engine
+        # to safeguard against out-of-vocab/padding tokens (e.g. 50273..50303)
+        self._valid_ids = set(base_enc._mergeable_ranks.values()) | set(self.special_tokens.values())
 
         # Cache standard special token IDs
         self._eot_id = self._safe_id("<|endoftext|>", 50256)
@@ -153,5 +157,12 @@ class PretrainedTiktokenTokenizer(BaseTokenizer):
     def encode(self, text: str) -> List[int]:
         return self.enc.encode(text, allowed_special="all")
 
-    def decode(self, ids: List[int]) -> str:
-        return self.enc.decode(ids)
+    def decode(self, ids: Union[Sequence[int], int], errors: str = "replace") -> str:
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        elif isinstance(ids, (int, float)):
+            ids = [int(ids)]
+
+        # Filter out padding and unmapped vocabulary slots before delegating to tiktoken
+        valid_ids = [int(i) for i in ids if int(i) in self._valid_ids]
+        return self.enc.decode(valid_ids, errors=errors)

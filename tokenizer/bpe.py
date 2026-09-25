@@ -4,7 +4,7 @@ for ChatML, reasoning chains (<think>), tool calling, and FIM code infilling.
 """
 
 import json
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 import regex as re
 
 from .base import BaseTokenizer
@@ -62,7 +62,7 @@ class CustomBPETokenizer(BaseTokenizer):
             dict(special_tokens) if special_tokens is not None else dict(DEFAULT_SPECIAL_TOKENS)
         )
         self.inverse_special_tokens: Dict[int, str] = {
-            v: k for k, v in self.special_tokens.items()
+            int(v): k for k, v in self.special_tokens.items()
         }
 
         self.merges: Dict[Tuple[str, str], int] = {}
@@ -303,25 +303,38 @@ class CustomBPETokenizer(BaseTokenizer):
             bpe_tokens.extend([self.encoder[t] for t in merged])
         return bpe_tokens
 
-    def decode(self, ids: List[int]) -> str:
+    def decode(self, ids: Union[Sequence[int], int], errors: str = "replace") -> str:
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        elif isinstance(ids, (int, float)):
+            ids = [int(ids)]
+
         out_str = []
         byte_buf = []
 
-        for idx in ids:
+        for raw_idx in ids:
+            try:
+                idx = int(raw_idx)
+            except (ValueError, TypeError):
+                continue
+
             if idx in self.inverse_special_tokens:
                 if byte_buf:
                     out_str.append(
-                        bytearray(byte_buf).decode("utf-8", errors="replace")
+                        bytearray(byte_buf).decode("utf-8", errors=errors)
                     )
                     byte_buf = []
                 out_str.append(self.inverse_special_tokens[idx])
-            else:
-                token_str = self.decoder.get(idx, "")
+            elif idx in self.decoder:
+                token_str = self.decoder[idx]
                 byte_buf.extend([self.byte_decoder[c] for c in token_str if c in self.byte_decoder])
+            else:
+                # Safely ignore unmapped/padding slots (e.g. 50273..50303)
+                continue
 
         if byte_buf:
             out_str.append(
-                bytearray(byte_buf).decode("utf-8", errors="replace")
+                bytearray(byte_buf).decode("utf-8", errors=errors)
             )
 
         return "".join(out_str)
@@ -340,7 +353,7 @@ class CustomBPETokenizer(BaseTokenizer):
             data = json.load(f)
         self.special_tokens = data.get("special_tokens", DEFAULT_SPECIAL_TOKENS)
         self.inverse_special_tokens = {
-            v: k for k, v in self.special_tokens.items()
+            int(v): k for k, v in self.special_tokens.items()
         }
         self.encoder = data["encoder"]
         self.decoder = {int(v): k for k, v in self.encoder.items()}
