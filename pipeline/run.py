@@ -123,10 +123,23 @@ class PipelineOrchestrator:
             )
             print(f"[Auto-Tuner] Recommended Micro-Batch Size per GPU: {self.auto_micro_batch}")
 
-        # 4. Dynamic Checkpoint Paths
-        self.pretrain_ckpt = f"checkpoints/pretrain_{self.size_tag}/best_model.pt"
-        self.sft_ckpt = f"checkpoints/sft_{self.size_tag}/sft_final.pt"
-        self.dpo_ckpt = f"checkpoints/dpo_{self.size_tag}/dpo_final.pt"
+    @property
+    def pretrain_ckpt(self) -> str:
+        best = f"checkpoints/pretrain_{self.size_tag}/best_model.pt"
+        final = f"checkpoints/pretrain_{self.size_tag}/final_model.pt"
+        return best if os.path.exists(best) else final
+
+    @property
+    def sft_ckpt(self) -> str:
+        best = f"checkpoints/sft_{self.size_tag}/best_sft_model.pt"
+        final = f"checkpoints/sft_{self.size_tag}/sft_final.pt"
+        return best if os.path.exists(best) else final
+
+    @property
+    def dpo_ckpt(self) -> str:
+        best = f"checkpoints/dpo_{self.size_tag}/best_dpo_model.pt"
+        final = f"checkpoints/dpo_{self.size_tag}/dpo_final.pt"
+        return best if os.path.exists(best) else final
 
     def print_stage_banner(self, name: str):
         print("\n" + "=" * 70)
