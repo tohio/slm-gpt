@@ -8,6 +8,13 @@ import os
 # Configure PyTorch virtual memory segments for orchestrator and subprocesses
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# Load local environment variables (.env) for API keys, tokens, and telemetry
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from dataclasses import dataclass
 import glob
 from pathlib import Path
