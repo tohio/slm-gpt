@@ -37,45 +37,61 @@ def normalize_preference_record(sample: Dict[str, Any]) -> Optional[Dict[str, st
     chosen_text = ""
     rejected_text = ""
 
-    # Top-level prompt string if present
-    if sample.get("prompt") and isinstance(sample["prompt"], str):
-        prompt_text = sample["prompt"].strip()
-
-    # 1. Conversational format: list of message dictionaries
-    if isinstance(sample.get("chosen"), list) and isinstance(sample.get("rejected"), list):
-        chosen_list = sample["chosen"]
-        rejected_list = sample["rejected"]
-
-        # Extract system prompt if present and not already set
-        if not system_text:
-            for msg in chosen_list:
-                if isinstance(msg, dict) and msg.get("role") == "system":
+    # 1. Extract prompt from top-level prompt field (handles str, list of dicts, or dict)
+    raw_prompt = sample.get("prompt")
+    if isinstance(raw_prompt, str):
+        prompt_text = raw_prompt.strip()
+    elif isinstance(raw_prompt, list):
+        for msg in raw_prompt:
+            if isinstance(msg, dict):
+                if msg.get("role") == "system" and not system_text:
                     system_text = msg.get("content", "").strip()
-                    break
+                elif msg.get("role") == "user":
+                    prompt_text = msg.get("content", "").strip()
+    elif isinstance(raw_prompt, dict):
+        if raw_prompt.get("role") == "user":
+            prompt_text = raw_prompt.get("content", "").strip()
 
-        # Extract user prompt from last user turn if not present at root
-        if not prompt_text:
-            for msg in reversed(chosen_list):
+    # 2. Extract completions (handles list of dicts, single dict, or str)
+    def _extract_completion(val: Any) -> Tuple[str, str]:
+        """Returns (completion_text, optional_system_text)."""
+        sys_txt = ""
+        comp_txt = ""
+        if isinstance(val, list):
+            for m in val:
+                if isinstance(m, dict) and m.get("role") == "system":
+                    sys_txt = m.get("content", "").strip()
+            if val and isinstance(val[-1], dict) and val[-1].get("role") == "assistant":
+                comp_txt = val[-1].get("content", "").strip()
+        elif isinstance(val, dict):
+            if val.get("role") == "assistant":
+                comp_txt = val.get("content", "").strip()
+        elif isinstance(val, str):
+            comp_txt = val.strip()
+        return comp_txt, sys_txt
+
+    chosen_extracted, sys_chosen = _extract_completion(sample.get("chosen"))
+    rejected_extracted, sys_rejected = _extract_completion(sample.get("rejected"))
+
+    if not system_text:
+        system_text = sys_chosen or sys_rejected
+
+    chosen_text = chosen_extracted
+    rejected_text = rejected_extracted
+
+    # 3. Fallback extraction if prompt is still missing
+    if not prompt_text:
+        if isinstance(sample.get("chosen"), list):
+            for msg in reversed(sample["chosen"]):
                 if isinstance(msg, dict) and msg.get("role") == "user":
                     prompt_text = msg.get("content", "").strip()
                     break
 
-        # Extract assistant completions
-        if chosen_list and isinstance(chosen_list[-1], dict) and chosen_list[-1].get("role") == "assistant":
-            chosen_text = chosen_list[-1].get("content", "").strip()
-        if rejected_list and isinstance(rejected_list[-1], dict) and rejected_list[-1].get("role") == "assistant":
-            rejected_text = rejected_list[-1].get("content", "").strip()
-
-    # 2. Flat string completion fallback
-    else:
-        if not prompt_text:
-            prompt_text = str(
-                sample.get("prompt", "")
-                or sample.get("question", "")
-                or sample.get("instruction", "")
-            ).strip()
-        chosen_text = str(sample.get("chosen", "")).strip()
-        rejected_text = str(sample.get("rejected", "")).strip()
+    if not prompt_text:
+        prompt_text = str(
+            sample.get("question", "")
+            or sample.get("instruction", "")
+        ).strip()
 
     # Integrity gate: All three core fields must be populated
     if not prompt_text or not chosen_text or not rejected_text:
@@ -93,19 +109,19 @@ def normalize_preference_record(sample: Dict[str, Any]) -> Optional[Dict[str, st
         return None
 
     max_len = max(chosen_words, rejected_words)
-    min_len = max(1, min(chosen_words, rejected_words))
-    if (max_len / min_len > 8.0) and (max_len > 100):
+    min_len = min(chosen_words, rejected_words)
+    if min_len > 0 and (max_len / min_len) > 8.0:
         return None
 
-    record = {
+    result = {
         "prompt": prompt_text,
         "chosen": chosen_text,
         "rejected": rejected_text,
     }
     if system_text:
-        record["system"] = system_text
+        result["system"] = system_text
 
-    return record
+    return result
 
 
 def harvest_dataset_records(dataset_name: str, budget: int) -> Tuple[List[Dict[str, str]], int]:
