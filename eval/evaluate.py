@@ -17,7 +17,7 @@ import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-# Ensure repository root is on sys.path
+# Ensure repository root is on sys.path regardless of execution directory
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from datasets import load_dataset
@@ -31,8 +31,14 @@ from transformer.model import DecoderOnlyTransformer as Transformer
 
 
 # =====================================================================
-# Checkpoint Loader & Scoring Helpers
+# Model Helpers & Checkpoint Loader
 # =====================================================================
+
+def forward_logits(model: Transformer, x: torch.Tensor) -> torch.Tensor:
+    """Safely extracts logits tensor from forward output whether tuple or raw tensor."""
+    out = model(x)
+    return out[0] if isinstance(out, (tuple, list)) else out
+
 
 def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, ModelConfig, Any]:
     """Loads model weights, configuration, and tokenizer from checkpoint file."""
@@ -42,14 +48,14 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, 
     print(f"\n[Loader] Loading weights from: {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
 
-    # 1. Resolve config (handles dataclass instances and raw dictionaries)
+    # 1. Resolve configuration (dataclass instance or serialized dict)
     raw_cfg = state.get("config") if isinstance(state, dict) else None
     if isinstance(raw_cfg, ModelConfig):
         cfg = raw_cfg
     elif isinstance(raw_cfg, dict):
         cfg = ModelConfig(**raw_cfg)
     else:
-        # Fallback to standard 127M configuration
+        # Fallback to standard 127M configuration defaults
         cfg = ModelConfig(
             vocab_size=50304,
             max_seq_len=2048,
@@ -75,12 +81,16 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, 
     if device == "cuda" and torch.cuda.is_bf16_supported():
         model = model.to(torch.bfloat16)
 
-    # 2. Extract and clean weights
-    model_state = (
-        state.get("model_state_dict")
-        or state.get("model")
-        or (state if isinstance(state, dict) and "state_dict" not in state else state.get("state_dict", state))
-    )
+    # 2. Extract and sanitize weights (strip DDP module. and torch.compile _orig_mod. prefixes)
+    if isinstance(state, dict):
+        model_state = (
+            state.get("model_state_dict")
+            or state.get("model")
+            or (state if "state_dict" not in state else state.get("state_dict"))
+        )
+    else:
+        model_state = state
+
     cleaned_state = {
         k.replace("_orig_mod.", "").replace("module.", ""): v
         for k, v in model_state.items()
@@ -118,7 +128,7 @@ def score_continuation_logprobs(
 
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
     with torch.amp.autocast(device_type=device, dtype=amp_dtype):
-        logits = model(x)
+        logits = forward_logits(model, x)
         log_probs = F.log_softmax(logits, dim=-1)
 
     prompt_len = len(prompt_tokens)
@@ -166,7 +176,7 @@ def eval_val_ppl(
         y = torch.from_numpy(data[start + 1 : start + seq_len + 1].astype(np.int64)).unsqueeze(0).to(device)
 
         with torch.amp.autocast(device_type=device, dtype=amp_dtype):
-            logits = model(x)
+            logits = forward_logits(model, x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), reduction="sum")
 
         total_loss += loss.item()
@@ -310,7 +320,7 @@ def eval_gsm8k(
             context_window = curr_ids[-max_len:]
             x = torch.tensor([context_window], dtype=torch.long, device=device)
             with torch.amp.autocast(device_type=device, dtype=amp_dtype):
-                logits = model(x)
+                logits = forward_logits(model, x)
             next_tok = int(torch.argmax(logits[0, -1, :]).item())
             curr_ids.append(next_tok)
             if next_tok == tokenizer.eot_id:
@@ -385,7 +395,7 @@ def eval_mbpp(
             context_window = curr_ids[-max_len:]
             x = torch.tensor([context_window], dtype=torch.long, device=device)
             with torch.amp.autocast(device_type=device, dtype=amp_dtype):
-                logits = model(x)
+                logits = forward_logits(model, x)
             next_tok = int(torch.argmax(logits[0, -1, :]).item())
             curr_ids.append(next_tok)
             if next_tok == tokenizer.eot_id:
