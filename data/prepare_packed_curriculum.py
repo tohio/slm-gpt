@@ -1,13 +1,11 @@
 """
 data/prepare_packed_curriculum.py: High-Throughput Physical Token Interleaving.
 Features:
-  - Multi-threaded batch tokenization across available CPU cores (GIL-free Rust tiktoken).
-  - Background asynchronous shard prefetching (zero download stall pauses).
-  - Direct contiguous uint16 memory buffering (eliminates Python heap GC thrashing).
+  - Direct Rust multi-threaded tokenization via tiktoken with allowed_special="all".
+  - Zero-copy list buffering with single-pass uint16 shard conversion.
   - Parameter-aware repetition capping across finite reasoning pools.
 """
 
-import concurrent.futures
 import glob
 import gzip
 import json
@@ -81,42 +79,26 @@ def compute_curriculum_weights(total_tokens: int, param_count: int) -> Dict[str,
 
 
 # =====================================================================
-# 2. Fast Batch Tokenizer Helper (Multi-Threaded)
+# 2. Fast Multithreaded Batch Tokenizer
 # =====================================================================
 
-def encode_text_batch(tokenizer: Any, texts: List[str]) -> List[List[int]]:
-    """Encodes a batch of strings, leveraging multi-threading across all CPU cores."""
+def fast_encode_batch(tokenizer: Any, texts: List[str]) -> List[List[int]]:
+    """Encodes a list of strings directly via tiktoken Rust multi-threading."""
     if not texts:
         return []
 
-    # 1. Native wrapper batch encode
-    if hasattr(tokenizer, "encode_batch"):
+    enc = getattr(tokenizer, "enc", None)
+    if enc and hasattr(enc, "encode_batch"):
         try:
-            return tokenizer.encode_batch(texts)
-        except TypeError:
+            return enc.encode_batch(texts, num_threads=16, allowed_special="all")
+        except Exception:
             pass
-
-    # 2. Tiktoken underlying encoder (releases GIL in Rust)
-    for attr in ("enc", "_enc", "encoder", "_encoder"):
-        underlying = getattr(tokenizer, attr, None)
-        if underlying and hasattr(underlying, "encode_batch"):
-            num_threads = min(32, os.cpu_count() or 8)
-            try:
-                return underlying.encode_batch(texts, num_threads=num_threads)
-            except Exception:
-                break
-
-    # 3. ThreadPool fallback
-    workers = min(16, os.cpu_count() or 4)
-    if len(texts) > 16 and workers > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            return list(ex.map(tokenizer.encode, texts))
 
     return [tokenizer.encode(t) for t in texts]
 
 
 # =====================================================================
-# 3. Stream Readers with Background Prefetching
+# 3. Stream Readers
 # =====================================================================
 
 class SourceReader:
@@ -167,7 +149,7 @@ class FastParquetReader(SourceReader):
     def _stream_from_jsonl(self, path: str, tokenizer) -> Iterator[List[int]]:
         opener = gzip.open if path.endswith(".gz") else open
         batch_texts: List[str] = []
-        batch_size = 1024
+        batch_size = 2048
 
         with opener(path, "rt", encoding="utf-8") as f:
             for line in f:
@@ -195,7 +177,7 @@ class FastParquetReader(SourceReader):
                     if text_val and isinstance(text_val, str) and len(text_val.strip()) > 0:
                         batch_texts.append(text_val)
                         if len(batch_texts) >= batch_size:
-                            for doc in encode_text_batch(tokenizer, batch_texts):
+                            for doc in fast_encode_batch(tokenizer, batch_texts):
                                 if doc:
                                     yield doc
                             batch_texts = []
@@ -203,7 +185,7 @@ class FastParquetReader(SourceReader):
                     continue
 
         if batch_texts:
-            for doc in encode_text_batch(tokenizer, batch_texts):
+            for doc in fast_encode_batch(tokenizer, batch_texts):
                 if doc:
                     yield doc
 
@@ -220,13 +202,12 @@ class FastParquetReader(SourceReader):
         if not col_to_use:
             col_to_use = schema_cols[0]
 
-        # Read in large 2048 chunks for fast batch tokenization
         for batch in pf.iter_batches(batch_size=2048, columns=[col_to_use]):
             raw_texts = batch[col_to_use].to_pylist()
             valid_texts = [t for t in raw_texts if t and isinstance(t, str) and len(t.strip()) > 0]
             if not valid_texts:
                 continue
-            for doc in encode_text_batch(tokenizer, valid_texts):
+            for doc in fast_encode_batch(tokenizer, valid_texts):
                 if doc:
                     yield doc
 
@@ -239,36 +220,25 @@ class FastParquetReader(SourceReader):
                 return
             print(f"[{self.name}] Resolved {len(self._target_files)} shard(s) in {self.repo}")
 
-        # Asynchronously prefetch the next parquet file while tokenizing the current one
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            def _fetch(fname):
-                return hf_hub_download(repo_id=self.repo, filename=fname, repo_type="dataset", token=token)
+        for target_file in self._target_files:
+            try:
+                local_path = hf_hub_download(
+                    repo_id=self.repo,
+                    filename=target_file,
+                    repo_type="dataset",
+                    token=token,
+                )
+            except Exception as e:
+                print(f"[{self.name}] Error downloading shard {target_file}: {e}")
+                continue
 
-            future = pool.submit(_fetch, self._target_files[0]) if self._target_files else None
-
-            for i, target_file in enumerate(self._target_files):
-                try:
-                    local_path = future.result() if future else None
-                except Exception as e:
-                    print(f"[{self.name}] Error downloading shard {target_file}: {e}")
-                    local_path = None
-
-                # Kick off next download immediately
-                if i + 1 < len(self._target_files):
-                    future = pool.submit(_fetch, self._target_files[i + 1])
+            try:
+                if local_path.endswith((".jsonl", ".jsonl.gz")):
+                    yield from self._stream_from_jsonl(local_path, tokenizer)
                 else:
-                    future = None
-
-                if not local_path:
-                    continue
-
-                try:
-                    if local_path.endswith((".jsonl", ".jsonl.gz")):
-                        yield from self._stream_from_jsonl(local_path, tokenizer)
-                    else:
-                        yield from self._stream_from_parquet(local_path, tokenizer)
-                except Exception as e:
-                    print(f"[{self.name}] Error reading shard {local_path}: {e}")
+                    yield from self._stream_from_parquet(local_path, tokenizer)
+            except Exception as e:
+                print(f"[{self.name}] Error reading shard {local_path}: {e}")
 
 
 class ReasoningParquetReader(FastParquetReader):
@@ -330,7 +300,7 @@ class ReasoningParquetReader(FastParquetReader):
                 docs.append(f"Problem:\n{p_clean}\n\nSolution:\n{sol_formatted}")
 
             if docs:
-                for doc in encode_text_batch(tokenizer, docs):
+                for doc in fast_encode_batch(tokenizer, docs):
                     if doc:
                         yield doc
 
@@ -362,7 +332,7 @@ class LocalBinReader(SourceReader):
 
 
 # =====================================================================
-# 4. Zero-Copy Contiguous Token Packing Engine
+# 4. Physical Packing Engine
 # =====================================================================
 
 def pack_curriculum_to_shards(
@@ -374,7 +344,7 @@ def pack_curriculum_to_shards(
     tokenizer_type: str = "tiktoken",
     tokenizer_path: Optional[str] = None,
 ):
-    """Packs multiple sources into contiguous .bin files using a preallocated uint16 buffer."""
+    """Physically packs multiple sources into contiguous .bin files using token-deficit scheduling."""
     os.makedirs(output_dir, exist_ok=True)
     tokenizer = get_tokenizer(tokenizer_type, tokenizer_path)
     eot_id = tokenizer.eot_id
@@ -427,18 +397,17 @@ def pack_curriculum_to_shards(
     val_data.tofile(val_file)
     print(f"✓ Wrote validation shard: {val_file} ({len(val_data):,} tokens, {os.path.getsize(val_file)/(1024*1024):.2f} MB)")
 
-    # 2. Pack Training Shards using pre-allocated numpy ring buffer
+    # 2. Pack Training Shards
     print("\nPacking training partition...")
-    shard_buffer = np.empty(shard_size_tokens, dtype=np.uint16)
-    shard_pos = 0
+    token_buffer: List[int] = []
     shard_idx = 0
     total_tokens_written = 0
     last_train_log = 0
 
-    while total_tokens_written + shard_pos < total_token_budget:
+    while total_tokens_written + len(token_buffer) < total_token_budget:
         total_so_far = max(1, sum(tokens_per_source))
 
-        # Fast pure-Python deficit calculation
+        # Pure-Python deficit check
         best_i = 0
         max_deficit = -1e9
         for i in range(num_sources):
@@ -457,46 +426,36 @@ def pack_curriculum_to_shards(
             except StopIteration:
                 continue
 
-        doc_len = len(doc_tokens) + 1
-        tokens_per_source[chosen_idx] += doc_len
+        token_buffer.extend(doc_tokens)
+        token_buffer.append(eot_id)
+        tokens_per_source[chosen_idx] += len(doc_tokens) + 1
 
-        # Fast numpy assembly of doc + eot
-        doc_arr = np.empty(doc_len, dtype=np.uint16)
-        doc_arr[:-1] = doc_tokens
-        doc_arr[-1] = eot_id
-
-        doc_offset = 0
-        while doc_offset < doc_len:
-            space = shard_size_tokens - shard_pos
-            chunk_size = min(space, doc_len - doc_offset)
-            shard_buffer[shard_pos : shard_pos + chunk_size] = doc_arr[doc_offset : doc_offset + chunk_size]
-            shard_pos += chunk_size
-            doc_offset += chunk_size
-
-            # Shard full: write directly from contiguous memory
-            if shard_pos == shard_size_tokens:
-                out_file = os.path.join(output_dir, f"train_{shard_idx:05d}.bin")
-                shard_buffer.tofile(out_file)
-                total_tokens_written += shard_size_tokens
-                shard_idx += 1
-                shard_pos = 0
-                pct = (total_tokens_written / total_token_budget) * 100
-                print(f"✓ Wrote {out_file} | Total: {total_tokens_written:,} / {total_token_budget:,} tokens ({pct:.1f}%)")
-
-                if total_tokens_written >= total_token_budget:
-                    break
-
-        total_current = total_tokens_written + shard_pos
+        total_current = total_tokens_written + len(token_buffer)
         if total_current - last_train_log >= max(50_000, total_token_budget // 20):
             pct = (total_current / total_token_budget) * 100
             print(f"  [Training] Packed {total_current:,} / {total_token_budget:,} tokens ({pct:.1f}%)")
             last_train_log = total_current
 
-    # Final remainder shard
-    if shard_pos > 0 and total_tokens_written < total_token_budget:
+        while len(token_buffer) >= shard_size_tokens:
+            shard_data = np.array(token_buffer[:shard_size_tokens], dtype=np.uint16)
+            out_file = os.path.join(output_dir, f"train_{shard_idx:05d}.bin")
+            shard_data.tofile(out_file)
+
+            total_tokens_written += shard_size_tokens
+            token_buffer = token_buffer[shard_size_tokens:]
+            pct = (total_tokens_written / total_token_budget) * 100
+            print(f"✓ Wrote {out_file} | Total: {total_tokens_written:,} / {total_token_budget:,} tokens ({pct:.1f}%)")
+            shard_idx += 1
+
+            if total_tokens_written >= total_token_budget:
+                break
+
+    # Remainder shard
+    if token_buffer and total_tokens_written < total_token_budget:
+        shard_data = np.array(token_buffer, dtype=np.uint16)
         out_file = os.path.join(output_dir, f"train_{shard_idx:05d}.bin")
-        shard_buffer[:shard_pos].tofile(out_file)
-        total_tokens_written += shard_pos
+        shard_data.tofile(out_file)
+        total_tokens_written += len(shard_data)
         print(f"✓ Wrote final remainder shard: {out_file} | Total: {total_tokens_written:,} tokens ({os.path.getsize(out_file)/(1024*1024):.2f} MB)")
 
     print("=" * 75)
