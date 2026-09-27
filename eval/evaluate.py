@@ -25,8 +25,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model.transformer import Transformer
-from scaling.config import ModelConfig
+
+from transformer.model import DecoderOnlyTransformer as Transformer
+from transformer.config import ModelConfig
 from tokenizer.factory import get_tokenizer
 
 
