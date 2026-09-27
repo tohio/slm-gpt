@@ -58,7 +58,7 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, 
         # Fallback to standard 127M configuration defaults
         cfg = ModelConfig(
             vocab_size=50304,
-            max_seq_len=2048,
+            max_seq_len=1024,
             d_model=768,
             n_heads=12,
             n_kv_heads=4,
@@ -70,7 +70,7 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, 
 
     # Architectural compatibility aliases
     if not hasattr(cfg, "seq_len"):
-        cfg.seq_len = getattr(cfg, "max_seq_len", 2048)
+        cfg.seq_len = getattr(cfg, "max_seq_len", 1024)
     if not hasattr(cfg, "dim"):
         cfg.dim = getattr(cfg, "d_model", 768)
 
@@ -116,12 +116,22 @@ def score_continuation_logprobs(
     device: str = "cuda",
 ) -> Tuple[float, float]:
     """Computes (sum_logprob, avg_logprob) of continuation_tokens conditioned on prompt_tokens."""
-    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
+    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 1024))
+
+    if not continuation_tokens:
+        return 0.0, 0.0
+
+    # Strict allocation: continuation capped to leave at least 1 prompt token
+    if len(continuation_tokens) >= max_len:
+        continuation_tokens = continuation_tokens[: max_len - 1]
+
+    prompt_budget = max_len - len(continuation_tokens)
+    if not prompt_tokens:
+        prompt_tokens = [getattr(model, "eot_id", 50256)]
+    elif len(prompt_tokens) > prompt_budget:
+        prompt_tokens = prompt_tokens[-prompt_budget:]
+
     full_seq = prompt_tokens + continuation_tokens
-    if len(full_seq) > max_len:
-        overflow = len(full_seq) - max_len
-        prompt_tokens = prompt_tokens[overflow:]
-        full_seq = prompt_tokens + continuation_tokens
 
     x = torch.tensor([full_seq[:-1]], dtype=torch.long, device=device)
     y = torch.tensor([full_seq[1:]], dtype=torch.long, device=device)
@@ -136,8 +146,8 @@ def score_continuation_logprobs(
     target_tokens = y[0, prompt_len - 1 :]
 
     token_logprobs = target_logits.gather(dim=-1, index=target_tokens.unsqueeze(-1)).squeeze(-1)
-    sum_logprob = token_logprobs.sum().item()
-    avg_logprob = token_logprobs.mean().item()
+    sum_logprob = float(token_logprobs.sum().item())
+    avg_logprob = float(token_logprobs.mean().item())
 
     return sum_logprob, avg_logprob
 
@@ -161,7 +171,7 @@ def eval_val_ppl(
     if len(data) > max_tokens:
         data = data[:max_tokens]
 
-    seq_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
+    seq_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 1024))
     num_chunks = (len(data) - 1) // seq_len
     if num_chunks == 0:
         return {"val_loss": float("nan"), "val_ppl": float("nan")}
@@ -241,10 +251,13 @@ def eval_arc_easy(
 ) -> Dict[str, float]:
     print(f"  • Running ARC-Easy ({limit:,} samples)...")
     try:
-        ds = load_dataset("ai2_arc", "ARC-Easy", split="test")
-    except Exception as e:
-        print(f"  ⚠️ Error loading ARC-Easy: {e}")
-        return {"arc_easy_acc": float("nan")}
+        ds = load_dataset("allenai/ai2_arc", "ARC-Easy", split="test")
+    except Exception:
+        try:
+            ds = load_dataset("ai2_arc", "ARC-Easy", split="test")
+        except Exception as e:
+            print(f"  ⚠️ Error loading ARC-Easy: {e}")
+            return {"arc_easy_acc": float("nan")}
 
     correct = 0
     total = 0
@@ -299,7 +312,7 @@ def eval_gsm8k(
     correct = 0
     closed_think_count = 0
     total = 0
-    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
+    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 1024))
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 
     for item in ds:
@@ -374,7 +387,7 @@ def eval_mbpp(
     passed = 0
     syntax_valid = 0
     total = 0
-    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
+    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 1024))
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 
     for item in ds:
