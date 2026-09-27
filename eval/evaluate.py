@@ -25,10 +25,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-
-from transformer.model import DecoderOnlyTransformer as Transformer
-from transformer.config import ModelConfig
 from tokenizer.factory import get_tokenizer
+from transformer.config import ModelConfig
+from transformer.model import DecoderOnlyTransformer as Transformer
 
 
 # =====================================================================
@@ -43,27 +42,49 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, 
     print(f"\n[Loader] Loading weights from: {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device)
 
-    # Resolve config
-    if "config" in state and isinstance(state["config"], ModelConfig):
-        cfg = state["config"]
+    # 1. Resolve config (handles dataclass instances and raw dictionaries)
+    raw_cfg = state.get("config") if isinstance(state, dict) else None
+    if isinstance(raw_cfg, ModelConfig):
+        cfg = raw_cfg
+    elif isinstance(raw_cfg, dict):
+        cfg = ModelConfig(**raw_cfg)
     else:
-        # Fallback to 127M architecture default if config object wasn't pickled directly
+        # Fallback to standard 127M configuration
         cfg = ModelConfig(
-            dim=768,
-            n_layers=14,
+            vocab_size=50304,
+            max_seq_len=2048,
+            d_model=768,
             n_heads=12,
             n_kv_heads=4,
-            vocab_size=50277,
-            seq_len=2048,
+            d_ffn=2048,
+            n_layers=14,
+            dropout=0.0,
+            bias=False,
         )
 
+    # Architectural compatibility aliases
+    if not hasattr(cfg, "seq_len"):
+        cfg.seq_len = getattr(cfg, "max_seq_len", 2048)
+    if not hasattr(cfg, "dim"):
+        cfg.dim = getattr(cfg, "d_model", 768)
+
     model = Transformer(cfg).to(device)
+    model.cfg = cfg
+    model.config = cfg
+
     if device == "cuda" and torch.cuda.is_bf16_supported():
         model = model.to(torch.bfloat16)
 
-    model_state = state.get("model", state)
-    # Strip torch.compile prefixes if present
-    cleaned_state = {k.replace("_orig_mod.", ""): v for k, v in model_state.items()}
+    # 2. Extract and clean weights
+    model_state = (
+        state.get("model_state_dict")
+        or state.get("model")
+        or (state if isinstance(state, dict) and "state_dict" not in state else state.get("state_dict", state))
+    )
+    cleaned_state = {
+        k.replace("_orig_mod.", "").replace("module.", ""): v
+        for k, v in model_state.items()
+    }
     model.load_state_dict(cleaned_state)
     model.eval()
 
@@ -72,7 +93,7 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, 
     tokenizer = get_tokenizer(tokenizer_type, tokenizer_path)
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"[Loader] Initialized model: {total_params:,} parameters (dim={cfg.dim}, layers={cfg.n_layers})")
+    print(f"[Loader] Initialized model: {total_params:,} parameters (d_model={cfg.d_model}, layers={cfg.n_layers})")
 
     return model, cfg, tokenizer
 
@@ -84,13 +105,11 @@ def score_continuation_logprobs(
     continuation_tokens: List[int],
     device: str = "cuda",
 ) -> Tuple[float, float]:
-    """
-    Computes (sum_logprob, avg_logprob) of continuation_tokens conditioned on prompt_tokens.
-    """
+    """Computes (sum_logprob, avg_logprob) of continuation_tokens conditioned on prompt_tokens."""
+    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
     full_seq = prompt_tokens + continuation_tokens
-    if len(full_seq) > model.cfg.seq_len:
-        # Truncate left of prompt if exceeding context
-        overflow = len(full_seq) - model.cfg.seq_len
+    if len(full_seq) > max_len:
+        overflow = len(full_seq) - max_len
         prompt_tokens = prompt_tokens[overflow:]
         full_seq = prompt_tokens + continuation_tokens
 
@@ -100,10 +119,8 @@ def score_continuation_logprobs(
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
     with torch.amp.autocast(device_type=device, dtype=amp_dtype):
         logits = model(x)
-        # Log-softmax over vocabulary
         log_probs = F.log_softmax(logits, dim=-1)
 
-    # Slice strictly the target continuation tokens
     prompt_len = len(prompt_tokens)
     target_logits = log_probs[0, prompt_len - 1 :]
     target_tokens = y[0, prompt_len - 1 :]
@@ -134,7 +151,7 @@ def eval_val_ppl(
     if len(data) > max_tokens:
         data = data[:max_tokens]
 
-    seq_len = model.cfg.seq_len
+    seq_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
     num_chunks = (len(data) - 1) // seq_len
     if num_chunks == 0:
         return {"val_loss": float("nan"), "val_ppl": float("nan")}
@@ -272,6 +289,7 @@ def eval_gsm8k(
     correct = 0
     closed_think_count = 0
     total = 0
+    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 
     for item in ds:
@@ -284,14 +302,12 @@ def eval_gsm8k(
             continue
         gold_val = gold_match.group(1).replace(",", "").strip()
 
-        # Aligns with reasoning format trained in Stage 0/1
         prompt = f"Problem:\n{q}\n\nSolution:\n<think>\n"
         input_ids = tokenizer.encode(prompt)
         curr_ids = list(input_ids)
 
-        # Greedy decode up to 384 tokens
         for _ in range(384):
-            context_window = curr_ids[-model.cfg.seq_len :]
+            context_window = curr_ids[-max_len:]
             x = torch.tensor([context_window], dtype=torch.long, device=device)
             with torch.amp.autocast(device_type=device, dtype=amp_dtype):
                 logits = model(x)
@@ -304,11 +320,9 @@ def eval_gsm8k(
 
         if "</think>" in completion:
             closed_think_count += 1
-            # Extract final answer that follows the closing tag
             after_think = completion.split("</think>")[-1]
             nums = re.findall(r"(-?[0-9]+(?:\.[0-9]+)?)", after_think)
         else:
-            # Fallback to any trailing number
             nums = re.findall(r"(-?[0-9]+(?:\.[0-9]+)?)", completion)
 
         pred_val = nums[-1] if nums else None
@@ -350,6 +364,7 @@ def eval_mbpp(
     passed = 0
     syntax_valid = 0
     total = 0
+    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 
     for item in ds:
@@ -367,7 +382,7 @@ def eval_mbpp(
         curr_ids = list(input_ids)
 
         for _ in range(256):
-            context_window = curr_ids[-model.cfg.seq_len :]
+            context_window = curr_ids[-max_len:]
             x = torch.tensor([context_window], dtype=torch.long, device=device)
             with torch.amp.autocast(device_type=device, dtype=amp_dtype):
                 logits = model(x)
@@ -377,10 +392,8 @@ def eval_mbpp(
                 break
 
         completion = tokenizer.decode(curr_ids[len(input_ids) :])
-        # Extract code body up to markdown fence or end of text
         code_body = completion.split("```")[0].strip()
 
-        # AST syntax check
         try:
             ast.parse(code_body)
             syntax_valid += 1
@@ -388,7 +401,6 @@ def eval_mbpp(
         except Exception:
             is_syntactic = False
 
-        # Unit test execution check
         is_pass = False
         if is_syntactic and test_cases:
             try:
@@ -551,13 +563,13 @@ if __name__ == "__main__":
         if "=" in arg:
             k, v = arg.split("=", 1)
             k = k.lstrip("-")
-            if k in ("ckpt", "ckpt_path", "checkpoint"):
+            if k in ("ckpt", "ckpt_path", "checkpoint", "checkpoint_path", "model", "model_path"):
                 kwargs["ckpt_path"] = v
             elif k in ("val_shard", "val_bin"):
                 kwargs["val_shard"] = v
             elif k in ("dpo_path", "dpo_file"):
                 kwargs["dpo_path"] = v
-            elif k in ("limit", "samples", "n"):
+            elif k in ("limit", "samples", "num_samples", "n", "max_samples"):
                 kwargs["limit"] = int(v)
             elif k == "tasks":
                 kwargs["tasks"] = [t.strip() for t in v.split(",")]
