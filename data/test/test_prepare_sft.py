@@ -40,7 +40,7 @@ class TestPythonASTValidation:
 
     def test_valid_raw_string_escape_sequences(self):
         """Raw strings with regex escapes must pass AST validation."""
-        valid_raw_code = 'import re\npattern = r"\c"'
+        valid_raw_code = 'import re\npattern = r"\\c"'
         assert validate_python_ast(valid_raw_code) is True
 
 
