@@ -4,6 +4,7 @@ Features:
   - Direct Rust multi-threaded tokenization via tiktoken with allowed_special="all".
   - Zero-copy list buffering with single-pass uint16 shard conversion.
   - Parameter-aware repetition capping across finite reasoning pools.
+  - Automatic dynamic Hugging Face dataset card generation.
 """
 
 import glob
@@ -25,6 +26,8 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from tokenizer.factory import get_tokenizer
+
+from data.datacard import create_dataset_card
 
 
 # =====================================================================
@@ -456,11 +459,43 @@ def pack_curriculum_to_shards(
         out_file = os.path.join(output_dir, f"train_{shard_idx:05d}.bin")
         shard_data.tofile(out_file)
         total_tokens_written += len(shard_data)
+        shard_idx += 1
         print(f"✓ Wrote final remainder shard: {out_file} | Total: {total_tokens_written:,} tokens ({os.path.getsize(out_file)/(1024*1024):.2f} MB)")
 
     print("=" * 75)
     print(f"Physical packing complete. Total train tokens: {total_tokens_written:,}")
     print("=" * 75)
+
+    # 3. Dynamic Dataset Card Generation
+    source_stats = {}
+    for s, count in zip(sources, tokens_per_source):
+        repo = getattr(s, "repo", getattr(s, "directory", "Custom"))
+        status = "100% Unique"
+        if s.name in FINITE_POOLS:
+            epochs = count / FINITE_POOLS[s.name]
+            status = f"{epochs:.2f}× Repetition Ceiling" if epochs > 1.0 else "100% Unique"
+
+        source_stats[s.name] = {
+            "upstream": repo,
+            "tokens": count,
+            "status": status,
+        }
+
+    dataset_name = f"slm-curriculum-{max(1, int(round(total_tokens_written / 1e9)))}b"
+
+    create_dataset_card(
+        output_dir=output_dir,
+        dataset_name=dataset_name,
+        total_tokens=total_tokens_written,
+        shard_count=shard_idx,
+        tokens_per_shard=shard_size_tokens,
+        source_stats=source_stats,
+        val_tokens=len(val_data),
+        tokenizer_type=tokenizer_type,
+        vocab_size=getattr(tokenizer, "vocab_size", 50257),
+        eot_token_id=eot_id,
+        special_tokens=getattr(tokenizer, "special_tokens", None),
+    )
 
 
 def build_default_curriculum(

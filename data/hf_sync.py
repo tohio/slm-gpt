@@ -1,7 +1,7 @@
 """
-data/hub_sync.py: Fast HF Hub Dataset Synchronization Utility for slm-gpt.
+data/hf_sync.py: Fast HF Hub Dataset Synchronization Utility for slm-gpt.
 Decouples CPU-heavy tokenization and curriculum packing from expensive GPU nodes.
-Supports parallel multi-part push and fast snapshot pull for pretrain, SFT, and DPO.
+Supports parallel multi-part push, root dataset card sync, and fast snapshot pull for pretrain, SFT, and DPO.
 """
 
 import os
@@ -26,7 +26,7 @@ sys.path.insert(0, str(REPO_ROOT))
 def parse_cli_args() -> Dict[str, Any]:
     kwargs = {
         "action": "pull",          # 'push' or 'pull'
-        "repo_id": None,           # e.g., 'username/slm-gpt-curriculum-5b'
+        "repo_id": None,           # e.g., 'username/slm-curriculum-5b'
         "stages": "pretrain,sft,dpo", # comma-separated: 'pretrain', 'sft', 'dpo', or 'all'
         "data_dir": "data",
         "private": True,
@@ -83,6 +83,25 @@ def push_dataset(repo_id: str, data_dir: str = "data", stages: List[str] = None,
         )
         print(f"  ✓ Uploaded stage: {stage}")
 
+    # Check for dynamically generated dataset card and sync to Hugging Face repository root
+    readme_candidates = [
+        data_path / "pretrain" / "README.md",
+        data_path / "README.md",
+        REPO_ROOT / "README.md",
+    ]
+    readme_file = next((p for p in readme_candidates if p.is_file()), None)
+
+    if readme_file:
+        print(f"\n[Hub Push] Syncing dynamic dataset card from '{readme_file}' to repo root...")
+        api.upload_file(
+            path_or_fileobj=str(readme_file),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message="docs: sync dynamic dataset card",
+        )
+        print("  ✓ Dataset card synced to repository root.")
+
     print("\n" + "=" * 70)
     print(f"✓ All requested stages successfully pushed to: https://huggingface.co/datasets/{repo_id}")
     print("=" * 70)
@@ -95,12 +114,11 @@ def pull_dataset(repo_id: str, data_dir: str = "data", stages: List[str] = None,
     target_data_dir.mkdir(parents=True, exist_ok=True)
 
     requested = stages or ["pretrain", "sft", "dpo"]
-    patterns = [f"{st}/*" for st in requested]
+    patterns = [f"{st}/*" for st in requested] + ["README.md"]
 
     print(f"[Hub Pull] Target patterns: {patterns}")
     print(f"[Hub Pull] Parallel workers: {max_workers}")
 
-    # Fast multi-threaded snapshot download
     downloaded_path = snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
@@ -125,8 +143,8 @@ def main():
     args = parse_cli_args()
     if not args["repo_id"]:
         print("Usage:")
-        print("  Push: python data/hub_sync.py action=push repo_id=<username>/<dataset_name> [stages=pretrain,sft,dpo]")
-        print("  Pull: python data/hub_sync.py action=pull repo_id=<username>/<dataset_name> [stages=pretrain,sft,dpo]")
+        print("  Push: python data/hf_sync.py action=push repo_id=<username>/<dataset_name> [stages=pretrain,sft,dpo]")
+        print("  Pull: python data/hf_sync.py action=pull repo_id=<username>/<dataset_name> [stages=pretrain,sft,dpo]")
         sys.exit(1)
 
     stages = [s.strip() for s in args["stages"].split(",") if s.strip()]
