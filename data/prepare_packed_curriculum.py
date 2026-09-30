@@ -477,7 +477,7 @@ def build_default_curriculum(
     w = compute_curriculum_weights(total_tokens=total_tokens, param_count=param_count)
 
     return [
-        FastParquetReader("FineWeb-Edu", "HuggingFaceFW/fineweb-edu", "sample/10BT", "text", weight=w["FineWeb-Edu"]),
+        FastParquetReader("FineWeb-Edu", "HuggingFaceFW/fineweb-edu", "sample/100BT", "text", weight=w["FineWeb-Edu"]),
         FastParquetReader("DCLM-Edu", "HuggingFaceTB/dclm-edu", None, "text", weight=w["DCLM-Edu"]),
         FastParquetReader("The Stack-Edu", "HuggingFaceTB/smollm-corpus", "python-edu", "content", weight=w["The Stack-Edu"]),
         ReasoningParquetReader("OpenMathReasoning", "nvidia/OpenMathReasoning", None, "problem", "generated_solution", weight=w["OpenMathReasoning"], wrap_think_tag=False),
