@@ -1,6 +1,11 @@
-# Minimum toolchain to profile hardware and build kernels
+# Minimum toolchain to profile hardware, build kernels, and prepare datasets
 torch
 numpy
 packaging>=23.0
 ninja>=1.11.0
 python-dotenv>=1.0.0
+
+# Dataset ingestion, tokenization & Hub synchronization (CPU & GPU)
+datasets>=2.19.0
+tiktoken>=0.7.0
+huggingface_hub>=0.23.0
