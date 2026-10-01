@@ -4,11 +4,15 @@ Maps exact internal transformer keys (including fused kv_proj and c_proj)
 to standard LlamaForCausalLM schema for zero-code execution.
 """
 
-from dataclasses import asdict
+from dataclasses import asdict, fields
 import json
 import os
+from pathlib import Path
 import sys
 from typing import Any, Dict, Optional
+
+# Ensure repository root is in sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from safetensors.torch import save_file
 import torch
@@ -39,7 +43,7 @@ def remap_state_dict_to_hf_llama(
         elif k in ("ln_f.weight", "norm.weight"):
             hf_dict["model.norm.weight"] = tensor
 
-        # 2. Transformer Layers (layers.X)
+        # 2. Transformer Layers (layers.X or blocks.X)
         elif k.startswith("layers.") or k.startswith("blocks."):
             parts = k.split(".")
             layer_idx = parts[1]
@@ -95,14 +99,14 @@ def build_hf_config(cfg: ModelConfig) -> Dict[str, Any]:
     return {
         "architectures": ["LlamaForCausalLM"],
         "attention_bias": False,
-        "attention_dropout": cfg.dropout,
+        "attention_dropout": getattr(cfg, "dropout", getattr(cfg, "dropout_p", 0.0)),
         "bos_token_id": 50256,
         "eos_token_id": 50258,
         "hidden_act": "silu",
-        "hidden_size": cfg.d_model,
+        "hidden_size": getattr(cfg, "d_model", getattr(cfg, "dim", 768)),
         "initializer_range": 0.02,
-        "intermediate_size": cfg.d_ffn,
-        "max_position_embeddings": cfg.max_seq_len,
+        "intermediate_size": getattr(cfg, "d_ffn", 2048),
+        "max_position_embeddings": getattr(cfg, "max_seq_len", getattr(cfg, "seq_len", 2048)),
         "model_type": "llama",
         "num_attention_heads": cfg.n_heads,
         "num_hidden_layers": cfg.n_layers,
@@ -136,18 +140,47 @@ def convert_checkpoint_to_hf(
     print(f"Loading checkpoint from: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    # 1. Resolve Config
-    cfg_raw = ckpt.get("config")
-    if isinstance(cfg_raw, dict):
-        cfg = ModelConfig(**cfg_raw)
-    elif isinstance(cfg_raw, ModelConfig):
-        cfg = cfg_raw
-    else:
-        raise ValueError("Checkpoint does not contain valid 'config' metadata.")
+    # 1. Resolve Config with robust fallback
+    valid_fields = {f.name for f in fields(ModelConfig)}
+    cfg_raw = ckpt.get("config") if isinstance(ckpt, dict) else None
 
-    # 2. Extract and Remap State Dict
-    state_dict = ckpt.get("model_state_dict", ckpt)
-    hf_state_dict = remap_state_dict_to_hf_llama(state_dict, cfg)
+    if isinstance(cfg_raw, ModelConfig):
+        cfg = cfg_raw
+    elif isinstance(cfg_raw, dict):
+        filtered = {k: v for k, v in cfg_raw.items() if k in valid_fields}
+        cfg = ModelConfig(**filtered)
+    elif hasattr(cfg_raw, "__dict__"):
+        filtered = {k: v for k, v in cfg_raw.__dict__.items() if k in valid_fields}
+        cfg = ModelConfig(**filtered)
+    else:
+        print("  ⚠️ No valid 'config' found in checkpoint. Falling back to default 125M ModelConfig.")
+        cfg = ModelConfig(
+            vocab_size=50304,
+            max_seq_len=2048,
+            d_model=768,
+            n_heads=12,
+            n_kv_heads=4,
+            d_ffn=2048,
+            n_layers=14,
+            dropout=0.0,
+            bias=False,
+        )
+
+    # 2. Extract, sanitize, and remap State Dict (strip DDP and compile prefixes)
+    if isinstance(ckpt, dict):
+        raw_state = (
+            ckpt.get("model_state_dict")
+            or ckpt.get("model")
+            or (ckpt if "state_dict" not in ckpt else ckpt.get("state_dict"))
+        )
+    else:
+        raw_state = ckpt
+
+    cleaned_state = {
+        k.replace("_orig_mod.", "").replace("module.", ""): v
+        for k, v in raw_state.items()
+    }
+    hf_state_dict = remap_state_dict_to_hf_llama(cleaned_state, cfg)
 
     # 3. Cast to target dtype (bfloat16)
     for k in list(hf_state_dict.keys()):
@@ -166,12 +199,13 @@ def convert_checkpoint_to_hf(
     print(f"✓ Saved HF Config: {config_path}")
 
     # 6. Save Generation & Tokenizer Configs
-    meta = ckpt.get("runtime_meta", {})
+    meta = ckpt.get("runtime_meta", {}) if isinstance(ckpt, dict) else {}
     tok_t = tokenizer_type or meta.get("tokenizer_type", "tiktoken")
     tok_p = tokenizer_path or meta.get("tokenizer_path", None)
     tokenizer = get_tokenizer(tok_t, tok_p)
 
-    write_generation_assets(output_dir, tokenizer, max_seq_len=cfg.max_seq_len)
+    max_len = getattr(cfg, "max_seq_len", getattr(cfg, "seq_len", 2048))
+    write_generation_assets(output_dir, tokenizer, max_seq_len=max_len)
     print("✓ Saved Tokenizer & Generation Configs (ChatML Jinja template enabled)")
 
     return output_dir
