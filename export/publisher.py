@@ -40,7 +40,7 @@ DEFAULT_DATASET_TAGS = [
     "bigcode/the-stack",
     "AI-MO/NuminaMath-CoT",
     "nvidia/OpenMathReasoning",
-    "tohio/tohio/slm-synthetic-pretrain",
+    "tohio/slm-synthetic-pretrain",
 ]
 
 
