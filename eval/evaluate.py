@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Ensure repository root is on sys.path regardless of execution directory
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -40,13 +40,20 @@ def forward_logits(model: Transformer, x: torch.Tensor) -> torch.Tensor:
     return out[0] if isinstance(out, (tuple, list)) else out
 
 
+def get_stop_token_ids(tokenizer: Any) -> Set[int]:
+    """Resolves all valid terminal token IDs (EOT + ChatML im_end)."""
+    eot_id = getattr(tokenizer, "eot_id", 50256)
+    im_end_id = getattr(tokenizer, "im_end_id", 50258)
+    return {eot_id, im_end_id}
+
+
 def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, ModelConfig, Any]:
     """Loads model weights, configuration, and tokenizer from checkpoint file."""
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
 
     print(f"\n[Loader] Loading weights from: {ckpt_path}")
-    state = torch.load(ckpt_path, map_location=device)
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
 
     # 1. Resolve configuration (dataclass instance or serialized dict)
     raw_cfg = state.get("config") if isinstance(state, dict) else None
@@ -55,10 +62,10 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, 
     elif isinstance(raw_cfg, dict):
         cfg = ModelConfig(**raw_cfg)
     else:
-        # Fallback to standard 127M configuration defaults
+        # Fallback aligned with 125M / 127M architecture
         cfg = ModelConfig(
             vocab_size=50304,
-            max_seq_len=1024,
+            max_seq_len=2048,
             d_model=768,
             n_heads=12,
             n_kv_heads=4,
@@ -70,7 +77,7 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, 
 
     # Architectural compatibility aliases
     if not hasattr(cfg, "seq_len"):
-        cfg.seq_len = getattr(cfg, "max_seq_len", 1024)
+        cfg.seq_len = getattr(cfg, "max_seq_len", 2048)
     if not hasattr(cfg, "dim"):
         cfg.dim = getattr(cfg, "d_model", 768)
 
@@ -95,7 +102,12 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda") -> Tuple[Transformer, 
         k.replace("_orig_mod.", "").replace("module.", ""): v
         for k, v in model_state.items()
     }
-    model.load_state_dict(cleaned_state)
+    model.load_state_dict(cleaned_state, strict=False)
+
+    # Tie embeddings
+    if hasattr(model, "lm_head") and hasattr(model, "wte"):
+        model.lm_head.weight = model.wte.weight
+
     model.eval()
 
     tokenizer_type = getattr(cfg, "tokenizer_type", "tiktoken")
@@ -116,7 +128,7 @@ def score_continuation_logprobs(
     device: str = "cuda",
 ) -> Tuple[float, float]:
     """Computes (sum_logprob, avg_logprob) of continuation_tokens conditioned on prompt_tokens."""
-    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 1024))
+    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
 
     if not continuation_tokens:
         return 0.0, 0.0
@@ -171,7 +183,7 @@ def eval_val_ppl(
     if len(data) > max_tokens:
         data = data[:max_tokens]
 
-    seq_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 1024))
+    seq_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
     num_chunks = (len(data) - 1) // seq_len
     if num_chunks == 0:
         return {"val_loss": float("nan"), "val_ppl": float("nan")}
@@ -312,8 +324,9 @@ def eval_gsm8k(
     correct = 0
     closed_think_count = 0
     total = 0
-    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 1024))
+    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
+    stop_tokens = get_stop_token_ids(tokenizer)
 
     for item in ds:
         if total >= limit:
@@ -336,7 +349,9 @@ def eval_gsm8k(
                 logits = forward_logits(model, x)
             next_tok = int(torch.argmax(logits[0, -1, :]).item())
             curr_ids.append(next_tok)
-            if next_tok == tokenizer.eot_id:
+
+            # Clean exit on either <|endoftext|> or <|im_end|>
+            if next_tok in stop_tokens:
                 break
 
         completion = tokenizer.decode(curr_ids[len(input_ids) :])
@@ -387,8 +402,9 @@ def eval_mbpp(
     passed = 0
     syntax_valid = 0
     total = 0
-    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 1024))
+    max_len = getattr(model.cfg, "max_seq_len", getattr(model.cfg, "seq_len", 2048))
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
+    stop_tokens = get_stop_token_ids(tokenizer)
 
     for item in ds:
         if total >= limit:
@@ -411,7 +427,9 @@ def eval_mbpp(
                 logits = forward_logits(model, x)
             next_tok = int(torch.argmax(logits[0, -1, :]).item())
             curr_ids.append(next_tok)
-            if next_tok == tokenizer.eot_id:
+
+            # Clean exit on either <|endoftext|> or <|im_end|>
+            if next_tok in stop_tokens:
                 break
 
         completion = tokenizer.decode(curr_ids[len(input_ids) :])
@@ -575,7 +593,7 @@ def run_evaluation(
 
 if __name__ == "__main__":
     kwargs: Dict[str, Any] = {
-        "ckpt_path": "checkpoints/pretrain_127M/pretrain_final.pt",
+        "ckpt_path": "checkpoints/dpo_127M/dpo_final.pt",
         "val_shard": "data/pretrain/val_00000.bin",
         "dpo_path": "data/dpo/preference_pairs.jsonl",
         "limit": 200,
