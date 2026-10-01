@@ -16,9 +16,21 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
+import warnings
 
-# Ensure repository root is on sys.path regardless of execution directory
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Suppress FlashAttention / Cutlass JIT compilation warnings on Blackwell
+warnings.filterwarnings("ignore", category=UserWarning, module="nvidia_cutlass_dsl")
+warnings.filterwarnings("ignore", message=".*Argument aux_data.*cannot be converted to a JitArgument.*")
+
+# Ensure repository root is on sys.path and load workspace .env
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(REPO_ROOT / ".env")
+except ImportError:
+    pass
 
 from datasets import load_dataset
 import numpy as np
@@ -481,7 +493,7 @@ def eval_dpo_margin(
 ) -> Dict[str, Any]:
     print(f"  • Running DPO Alignment Margin Check ({limit:,} pairs)...")
     if not os.path.exists(dpo_file):
-        print(f"  ⚠️ DPO file '{dpo_file}' not found. Skipping.")
+        print(f"  ⚠️️ DPO file '{dpo_file}' not found. Skipping.")
         return {"dpo_pref_acc": float("nan"), "mean_margin": float("nan")}
 
     pairs = []
