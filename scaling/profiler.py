@@ -267,7 +267,7 @@ def tune_micro_batch_size(
 
     estimated_batch = int(usable_vram / max(per_sample_gb, 0.1))
 
-    powers = [16, 8, 4, 2, 1] if max_seq_len >= 2048 else [32, 16, 8, 4, 2, 1]
+    powers = [128, 64, 32, 16, 8, 4, 2, 1] if max_seq_len >= 2048 else [256, 128, 64, 32, 16, 8, 4, 2, 1]
     for p in powers:
         if estimated_batch >= p:
             return p

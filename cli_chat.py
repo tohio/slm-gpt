@@ -1,6 +1,6 @@
 """
 cli_chat.py: Interactive command-line chat interface for slm-gpt.
-Supports multi-turn ChatML conversations, streaming generation,
+Supports multi-turn ChatML conversations, streaming token generation,
 graceful session clearing, and strict stop-token enforcement.
 """
 
@@ -11,7 +11,7 @@ import argparse
 from dataclasses import fields
 from pathlib import Path
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 import warnings
 
 # Suppress FlashAttention / Cutlass JIT compilation warnings
@@ -19,6 +19,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="nvidia_cutlass_d
 warnings.filterwarnings("ignore", message=".*Argument aux_data.*cannot be converted to a JitArgument.*")
 
 import torch
+import torch.nn.functional as F
 import torch.serialization
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -83,6 +84,101 @@ def build_chatml_prompt(
     return prompt
 
 
+@torch.no_grad()
+def stream_generate(
+    model: DecoderOnlyTransformer,
+    tokenizer,
+    prompt_ids: List[int],
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float,
+    stop_token_ids: Set[int],
+    device: str,
+    dtype: torch.dtype,
+    max_seq_len: int,
+) -> str:
+    """
+    Autoregressive KV-cached token generator with live terminal streaming,
+    isolated repetition penalty (generated tokens only), and hard stop checks.
+    """
+    model.eval()
+    x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+
+    # 1. Prefill prompt into KV caches
+    use_autocast = (device == "cuda") and (dtype in (torch.float16, torch.bfloat16))
+    with torch.amp.autocast(device_type="cuda", dtype=dtype, enabled=use_autocast):
+        logits, _, kv_caches = model(x)
+        logits = logits[:, -1, :]  # Shape: (1, Vocab)
+
+    generated_ids: List[int] = []
+    generated_text = ""
+
+    for _ in range(max_new_tokens):
+        # 2. Isolated repetition penalty (only penalizes newly generated tokens, NEVER prompt or stop tokens)
+        if repetition_penalty != 1.0 and len(generated_ids) > 0:
+            for token_id in set(generated_ids):
+                if token_id in stop_token_ids:
+                    continue
+                if logits[0, token_id] > 0:
+                    logits[0, token_id] /= repetition_penalty
+                else:
+                    logits[0, token_id] *= repetition_penalty
+
+        # 3. Temperature scaling
+        logits = logits / max(temperature, 1e-5)
+
+        # 4. Top-K filtering
+        if top_k > 0:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float("Inf")
+
+        # 5. Top-P (Nucleus) filtering
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = False
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            logits[:, indices_to_remove] = -float("Inf")
+
+        # 6. Sample next token
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        token_id = next_token.item()
+
+        # 7. Check stop tokens immediately before decoding or appending
+        if token_id in stop_token_ids:
+            break
+
+        generated_ids.append(token_id)
+
+        # 8. Live token decoding and streaming
+        current_decoded = tokenizer.decode(generated_ids)
+        new_token_str = current_decoded[len(generated_text):]
+        generated_text = current_decoded
+        sys.stdout.write(new_token_str)
+        sys.stdout.flush()
+
+        # Context boundary check
+        if len(prompt_ids) + len(generated_ids) >= max_seq_len:
+            break
+
+        # 9. Autoregressive step with updated KV cache
+        with torch.amp.autocast(device_type="cuda", dtype=dtype, enabled=use_autocast):
+            logits, _, kv_caches = model(next_token, kv_caches=kv_caches)
+            logits = logits[:, -1, :]
+
+    sys.stdout.write("\n\n")
+    sys.stdout.flush()
+
+    # Clean any residual stop sequences
+    clean = generated_text.split("<|im_end|>")[0].replace("<|endoftext|>", "").strip()
+    return clean
+
+
 def run_chat(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
@@ -92,15 +188,17 @@ def run_chat(args):
 
     im_end_id = getattr(tokenizer, "im_end_id", 50258)
     eot_id = getattr(tokenizer, "eot_id", 50256)
+    stop_tokens = {im_end_id, eot_id}
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"✓ Model initialized ({config.n_layers} layers, {total_params:,} parameters on {device.upper()} in {dtype}).")
     print("=" * 65)
     print("           slm-gpt Interactive Chat Interface              ")
-    print(f" Checkpoint: {args.checkpoint}")
-    print(f" Device:     {device.upper()} ({dtype})")
-    print(f" Sampling:   Temp={args.temperature} | Top-P={args.top_p} | Top-K={args.top_k} | Rep-Penalty={args.repetition_penalty}")
-    print(" Commands:   'clear' to reset dialogue, 'exit' or 'quit' to end.")
+    print(f" Checkpoint:  {args.checkpoint}")
+    print(f" Device:      {device.upper()} ({dtype})")
+    print(f" Sampling:    Temp={args.temperature} | Top-P={args.top_p} | Top-K={args.top_k} | Rep-Penalty={args.repetition_penalty}")
+    print(f" Multi-Turn:  {'Disabled (--single_turn)' if args.single_turn else f'Active (Max {args.max_history_turns} turns)'}")
+    print(" Commands:    'clear' to reset dialogue, 'exit' or 'quit' to end.")
     print("=" * 65 + "\n")
 
     history: List[Dict[str, str]] = []
@@ -124,46 +222,42 @@ def run_chat(args):
             print("Dialogue history cleared.\n")
             continue
 
-        # Append current user query
         history.append({"role": "user", "content": user_input})
 
-        # If single_turn is active, retain only the current user message
-        active_history = [history[-1]] if args.single_turn else history
+        # History pruning
+        if args.single_turn:
+            active_history = [history[-1]]
+        else:
+            # Retain only up to max_history_turns pairs
+            active_history = history[-(args.max_history_turns * 2):]
+
         prompt_text = build_chatml_prompt(active_history, system_prompt=args.system_prompt)
         input_ids = tokenizer.encode(prompt_text)
 
-        # Context window safety truncate (retain trailing tokens if context overflows)
-        if len(input_ids) >= config.max_seq_len - args.max_new_tokens:
-            input_ids = input_ids[-(config.max_seq_len - args.max_new_tokens - 1):]
+        # Context safety limit
+        max_prompt_len = config.max_seq_len - args.max_new_tokens
+        if len(input_ids) > max_prompt_len:
+            input_ids = input_ids[-max_prompt_len:]
 
-        x = torch.tensor([input_ids], dtype=torch.long, device=device)
+        sys.stdout.write("Assistant > ")
+        sys.stdout.flush()
 
-        use_autocast = (device == "cuda") and (dtype in (torch.float16, torch.bfloat16))
-        with torch.no_grad():
-            with torch.amp.autocast(device_type="cuda", dtype=dtype, enabled=use_autocast):
-                out = model.generate(
-                    x,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    top_k=args.top_k,
-                    top_p=args.top_p,
-                    repetition_penalty=args.repetition_penalty,
-                    eot_token_id=im_end_id,
-                )
+        response = stream_generate(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_ids=input_ids,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+            stop_token_ids=stop_tokens,
+            device=device,
+            dtype=dtype,
+            max_seq_len=config.max_seq_len,
+        )
 
-        full_output = tokenizer.decode(out[0].tolist())
-
-        # Extract only the newly generated text for the latest assistant turn
-        assistant_turn = full_output.split("<|im_start|>assistant\n")[-1]
-        clean_response = assistant_turn.split("<|im_end|>")[0].strip()
-
-        # Remove any stray secondary EOS/EOT tokens
-        clean_response = clean_response.replace("<|endoftext|>", "").strip()
-
-        print(f"Assistant > {clean_response}\n")
-
-        # Record cleanly into history with no token corruption
-        history.append({"role": "assistant", "content": clean_response})
+        history.append({"role": "assistant", "content": response})
 
 
 if __name__ == "__main__":
@@ -171,12 +265,13 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default="checkpoints/dpo_127M/dpo_final.pt")
     parser.add_argument("--tokenizer_type", type=str, default="tiktoken")
     parser.add_argument("--tokenizer_path", type=str, default=None)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=0.4)
     parser.add_argument("--top_k", type=int, default=40)
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--repetition_penalty", type=float, default=1.15)
-    parser.add_argument("--system_prompt", type=str, default="You are a factual, concise assistant. Answer directly.")
+    parser.add_argument("--repetition_penalty", type=float, default=1.05)
+    parser.add_argument("--system_prompt", type=str, default="", help="Optional system prompt (default empty for small models).")
+    parser.add_argument("--max_history_turns", type=int, default=3, help="Max conversational turns preserved in multi-turn mode.")
     parser.add_argument("--single_turn", action="store_true", help="Do not accumulate history across turns.")
 
     run_chat(parser.parse_args())

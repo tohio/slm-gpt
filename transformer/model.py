@@ -70,6 +70,8 @@ class DecoderOnlyTransformer(nn.Module):
     ) -> torch.Tensor:
         """
         Fast O(1) per-token autoregressive generation with RoPE & layerwise Key-Value caching.
+        Applies repetition penalty strictly to newly generated tokens, protecting the prompt
+        and explicit stop tokens.
         """
         self.eval()
 
@@ -77,10 +79,16 @@ class DecoderOnlyTransformer(nn.Module):
         logits, _, kv_caches = self(idx)
         logits = logits[:, -1, :]  # (B, V)
 
+        # Track only tokens emitted during this generation call
+        generated_tokens: list[int] = []
+
         # 2. Sequential generation: 1 token per forward step
         for _ in range(max_new_tokens):
-            if repetition_penalty != 1.0:
-                for token_id in set(idx[0].tolist()):
+            if repetition_penalty != 1.0 and len(generated_tokens) > 0:
+                for token_id in set(generated_tokens):
+                    # Never penalize the stop token
+                    if eot_token_id is not None and token_id == eot_token_id:
+                        continue
                     if logits[0, token_id] > 0:
                         logits[0, token_id] /= repetition_penalty
                     else:
@@ -103,12 +111,14 @@ class DecoderOnlyTransformer(nn.Module):
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+            token_val = next_token.item()
 
-            # Append the sampled token to the generated sequence first
+            # Append the sampled token to the generated sequence
             idx = torch.cat((idx, next_token), dim=1)
+            generated_tokens.append(token_val)
 
             # Exit cleanly if stop token is reached
-            if eot_token_id is not None and next_token.item() == eot_token_id:
+            if eot_token_id is not None and token_val == eot_token_id:
                 break
 
             if idx.size(1) >= self.config.max_seq_len:
