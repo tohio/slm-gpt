@@ -7,20 +7,40 @@ and uploads artifacts to Hugging Face.
 from dataclasses import asdict
 import json
 import os
+from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+
+# Ensure workspace root is resolved and load environment variables from .env
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from huggingface_hub import HfApi, create_repo
 import torch
 
 from export.convert import convert_checkpoint_to_hf
 
-# Default 4-Source curriculum references for metadata tagging
+# Pretraining curriculum sources for Markdown narrative
+PRETRAIN_DATASETS = [
+    "FineWeb-Edu",
+    "DCLM-Edu",
+    "The Stack-Edu",
+    "NuminaMath-CoT",
+    "OpenMathReasoning",
+    "SLM-Synthetic-Pretrain",
+]
+
+# Hugging Face Hub dataset identifiers for YAML frontmatter metadata
 DEFAULT_DATASET_TAGS = [
     "HuggingFaceFW/fineweb-edu",
-    "HuggingFaceTB/cosmopedia-v2",
-    "HuggingFaceTB/smollm-corpus",
-    "HuggingFaceTB/finemath",
+    "mlfoundations/dclm-baseline-1.0",
+    "bigcode/the-stack",
+    "AI-MO/NuminaMath-CoT",
+    "nvidia/OpenMathReasoning",
+    "tohio/tohio/slm-synthetic-pretrain",
 ]
 
 
@@ -29,20 +49,15 @@ def generate_model_card(
     size_tag: str,
     checkpoint_meta: Optional[Dict[str, Any]] = None,
     dataset_tags: Optional[List[str]] = None,
-    sources_distribution: Optional[Dict[str, float]] = None,
+    curriculum_datasets: Optional[List[str]] = None,
 ) -> str:
     """
     Generates a professional Model Card README.md with YAML metadata,
-    curriculum distribution tables, and quickstart snippets.
+    curriculum source inventory, and quickstart snippets.
     """
     meta = checkpoint_meta or {}
     tags = dataset_tags or DEFAULT_DATASET_TAGS
-    dist = sources_distribution or {
-        "FineWeb-Edu (General / Reasoning)": 0.50,
-        "Cosmopedia v2 (Synthetic Textbooks)": 0.20,
-        "The Stack-Edu / Python-Edu (Code)": 0.15,
-        "FineMath (Mathematical Deduction)": 0.15,
-    }
+    datasets_list = curriculum_datasets or PRETRAIN_DATASETS
 
     # 1. Build YAML Front-matter
     yaml_lines = [
@@ -74,22 +89,19 @@ def generate_model_card(
         "",
         "## Architecture Highlights",
         "- **Decoder-Only Transformer** with Rotary Position Embeddings (RoPE)",
-        "- **Attention:** Grouped-Query Attention (GQA, 3:1 ratio)",
-        "- **Activation:** SwiGLU Feed-Forward Network ($d_{ffn} \\approx \\frac{8}{3} d$)",
-        "- **Normalization:** Bias-free RMSNorm",
+        "- **Attention:** Grouped-Query Attention (GQA, 12:4 ratio)",
+        "- **Activation:** SwiGLU Feed-Forward Network ($d_{ffn} = 2048$)",
+        "- **Normalization:** Bias-free Pre-LayerNorm / RMSNorm",
         "- **Weight Tying:** Tied input embedding (`embed_tokens`) and output head (`lm_head`)",
-        "- **Hugging Face Native:** Compatible directly with `LlamaForCausalLM` (no `trust_remote_code=True` required)",
+        "- **Hugging Face Native:** Directly compatible with `LlamaForCausalLM`",
         "",
         "## Pre-training Curriculum",
-        "The base model was pre-trained across an interleaved multi-source domain mixture:",
+        "The base model was pre-trained across an interleaved multi-source domain mixture composed of:",
         "",
-        "| Domain / Family | Target Ratio | Purpose |",
-        "| :--- | :--- | :--- |",
     ]
 
-    for source_name, ratio in dist.items():
-        pct = f"{ratio * 100:.1f}%" if ratio <= 1.0 else f"{ratio:.1f}%"
-        body_lines.append(f"| `{source_name}` | **{pct}** | Structured representation learning |")
+    for source_name in datasets_list:
+        body_lines.append(f"- `{source_name}`")
 
     body_lines.extend([
         "",
@@ -152,14 +164,14 @@ def publish_to_hub(
     tokenizer_type: str = "tiktoken",
     tokenizer_path: Optional[str] = None,
     dataset_tags: Optional[List[str]] = None,
-    sources_distribution: Optional[Dict[str, float]] = None,
+    curriculum_datasets: Optional[List[str]] = None,
 ):
     """
     Converts checkpoint to SafeTensors, builds assets, and pushes directly to Hugging Face Hub.
     """
     api_token = token or os.environ.get("HF_TOKEN")
     if not api_token:
-        raise ValueError("Missing Hugging Face API token. Set HF_TOKEN environment variable or pass token=...")
+        raise ValueError("Missing Hugging Face API token. Set HF_TOKEN environment variable in .env or pass token=...")
 
     api = HfApi(token=api_token)
 
@@ -186,7 +198,7 @@ def publish_to_hub(
         size_tag=size_tag,
         checkpoint_meta=meta,
         dataset_tags=dataset_tags,
-        sources_distribution=sources_distribution,
+        curriculum_datasets=curriculum_datasets,
     )
 
     with open(os.path.join(export_dir, "README.md"), "w", encoding="utf-8") as f:
