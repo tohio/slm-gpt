@@ -1,7 +1,7 @@
 """
 data/hf_sync.py: Fast HF Hub Dataset Synchronization Utility for slm-gpt.
 Decouples CPU-heavy tokenization and curriculum packing from expensive GPU nodes.
-Supports parallel multi-part push, root dataset card sync, and fast snapshot pull for pretrain, SFT, and DPO.
+Supports parallel multi-part push, automated dataset card generation, and fast snapshot pull.
 """
 
 import os
@@ -20,17 +20,29 @@ from huggingface_hub import HfApi, snapshot_download, create_repo
 
 # Ensure repository root is on sys.path
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# Import dynamic dataset card generator
+try:
+    from data.generate_dataset_card import generate_card
+except ImportError:
+    try:
+        from generate_dataset_card import generate_card
+    except ImportError:
+        generate_card = None
 
 
 def parse_cli_args() -> Dict[str, Any]:
     kwargs = {
-        "action": "pull",          # 'push' or 'pull'
-        "repo_id": None,           # e.g., 'username/slm-curriculum-5b'
-        "stages": "pretrain,sft,dpo", # comma-separated: 'pretrain', 'sft', 'dpo', or 'all'
+        "action": "pull",              # 'push' or 'pull'
+        "repo_id": None,               # e.g., 'tohio/slm-curriculum-10b'
+        "stages": "pretrain,sft,dpo",  # comma-separated: 'pretrain', 'sft', 'dpo', or 'all'
         "data_dir": "data",
         "private": True,
         "max_workers": 8,
+        "tokens": None,                # '10B' or '80B' (inferred if None)
+        "model_target": None,          # '125M', '350M', '1B' (inferred if None)
     }
     for arg in sys.argv[1:]:
         if "=" in arg:
@@ -48,7 +60,14 @@ def parse_cli_args() -> Dict[str, Any]:
     return kwargs
 
 
-def push_dataset(repo_id: str, data_dir: str = "data", stages: List[str] = None, private: bool = True):
+def push_dataset(
+    repo_id: str,
+    data_dir: str = "data",
+    stages: List[str] = None,
+    private: bool = True,
+    tokens: str = None,
+    model_target: str = None,
+):
     token = os.getenv("HF_TOKEN")
     if not token:
         raise ValueError("HF_TOKEN environment variable not set. Add it to your .env or shell environment.")
@@ -60,15 +79,20 @@ def push_dataset(repo_id: str, data_dir: str = "data", stages: List[str] = None,
     data_path = Path(data_dir)
     upload_stages = stages or ["pretrain", "sft", "dpo"]
 
+    # 1. Upload stage binary artifacts
     for stage in upload_stages:
         stage_dir = data_path / stage
         if not stage_dir.exists():
-            print(f"  ⚠️ Skipping '{stage}': directory '{stage_dir}' not found.")
-            continue
+            # If data_dir contains the shards directly (e.g. data/slm-curriculum-10b/train_*.bin)
+            if stage == "pretrain" and any(data_path.glob("train_*.bin")):
+                stage_dir = data_path
+            else:
+                print(f"  ⚠️ Skipping '{stage}': directory '{stage_dir}' not found.")
+                continue
 
-        files = [f for f in stage_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
+        files = [f for f in stage_dir.iterdir() if f.is_file() and not f.name.startswith(".") and not f.name.endswith(".md")]
         if not files:
-            print(f"  ⚠️ No files found in '{stage_dir}'.")
+            print(f"  ⚠️️ No binary artifacts found in '{stage_dir}'.")
             continue
 
         total_bytes = sum(f.stat().st_size for f in files)
@@ -80,30 +104,41 @@ def push_dataset(repo_id: str, data_dir: str = "data", stages: List[str] = None,
             repo_id=repo_id,
             repo_type="dataset",
             commit_message=f"Upload {stage} artifacts ({len(files)} files)",
+            allow_patterns=["*.bin", "*.json", "*.jsonl", "*.parquet"],
         )
         print(f"  ✓ Uploaded stage: {stage}")
 
-    # Check for dynamically generated dataset card and sync to Hugging Face repository root
-    readme_candidates = [
-        data_path / "pretrain" / "README.md",
-        data_path / "README.md",
-        REPO_ROOT / "README.md",
-    ]
-    readme_file = next((p for p in readme_candidates if p.is_file()), None)
+    # 2. Automatically generate and push the dataset card
+    resolved_tokens = tokens
+    if not resolved_tokens:
+        resolved_tokens = "80B" if "80b" in repo_id.lower() else "10B"
 
-    if readme_file:
-        print(f"\n[Hub Push] Syncing dynamic dataset card from '{readme_file}' to repo root...")
+    resolved_target = model_target
+    if not resolved_target:
+        resolved_target = "350M" if resolved_tokens.upper() == "80B" else "125M"
+
+    readme_path = data_path / "README.md"
+    if generate_card is not None:
+        print(f"\n[Hub Push] Generating dynamic dataset card ({resolved_tokens}, {resolved_target}) via generate_dataset_card.py...")
+        generate_card(tokens=resolved_tokens, model_target=resolved_target, output_path=str(readme_path))
+    else:
+        print("  ⚠️ generate_card could not be imported; falling back to existing README.md if present.")
+
+    if readme_path.is_file():
+        print(f"[Hub Push] Syncing dataset card from '{readme_path}' to repo root...")
         api.upload_file(
-            path_or_fileobj=str(readme_file),
+            path_or_fileobj=str(readme_path),
             path_in_repo="README.md",
             repo_id=repo_id,
             repo_type="dataset",
             commit_message="docs: sync dynamic dataset card",
         )
         print("  ✓ Dataset card synced to repository root.")
+    else:
+        print(f"  ⚠️ No dataset card found at '{readme_path}' to upload.")
 
     print("\n" + "=" * 70)
-    print(f"✓ All requested stages successfully pushed to: https://huggingface.co/datasets/{repo_id}")
+    print(f"✓ Push complete: https://huggingface.co/datasets/{repo_id}")
     print("=" * 70)
 
 
@@ -119,7 +154,7 @@ def pull_dataset(repo_id: str, data_dir: str = "data", stages: List[str] = None,
     print(f"[Hub Pull] Target patterns: {patterns}")
     print(f"[Hub Pull] Parallel workers: {max_workers}")
 
-    downloaded_path = snapshot_download(
+    snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
         local_dir=str(target_data_dir),
@@ -143,8 +178,8 @@ def main():
     args = parse_cli_args()
     if not args["repo_id"]:
         print("Usage:")
-        print("  Push: python data/hf_sync.py action=push repo_id=<username>/<dataset_name> [stages=pretrain,sft,dpo]")
-        print("  Pull: python data/hf_sync.py action=pull repo_id=<username>/<dataset_name> [stages=pretrain,sft,dpo]")
+        print("  Push: python3 data/hf_sync.py action=push repo_id=<username>/<dataset_name> [stages=pretrain,sft,dpo]")
+        print("  Pull: python3 data/hf_sync.py action=pull repo_id=<username>/<dataset_name> [stages=pretrain,sft,dpo]")
         sys.exit(1)
 
     stages = [s.strip() for s in args["stages"].split(",") if s.strip()]
@@ -158,6 +193,8 @@ def main():
             data_dir=args["data_dir"],
             stages=stages,
             private=args["private"],
+            tokens=args["tokens"],
+            model_target=args["model_target"],
         )
     elif action == "pull":
         pull_dataset(
