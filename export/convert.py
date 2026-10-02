@@ -1,3 +1,4 @@
+from transformer.env import get_model_tag
 """
 export/convert.py: Converts slm-gpt PyTorch checkpoints to Hugging Face SafeTensors.
 Maps exact internal transformer keys (including fused kv_proj and c_proj)
@@ -29,8 +30,10 @@ def remap_state_dict_to_hf_llama(
     """
     Remaps slm-gpt internal state dict to Hugging Face LlamaForCausalLM naming conventions.
     Extracts k_proj and v_proj from fused kv_proj, and maps c_proj to o_proj.
+    Omits lm_head.weight when tie_word_embeddings is True to avoid redundant tensor storage.
     """
     hf_dict: Dict[str, torch.Tensor] = {}
+    tie_embeddings = getattr(cfg, "tie_word_embeddings", True)
 
     for k, v in custom_state_dict.items():
         tensor = v.contiguous()
@@ -39,7 +42,8 @@ def remap_state_dict_to_hf_llama(
         if k in ("wte.weight", "embed.weight"):
             hf_dict["model.embed_tokens.weight"] = tensor
         elif k == "lm_head.weight":
-            hf_dict["lm_head.weight"] = tensor
+            if not tie_embeddings:
+                hf_dict["lm_head.weight"] = tensor
         elif k in ("ln_f.weight", "norm.weight"):
             hf_dict["model.norm.weight"] = tensor
 
@@ -87,15 +91,16 @@ def remap_state_dict_to_hf_llama(
         else:
             hf_dict[k] = tensor
 
-    # Guarantee lm_head exists (tied embeddings)
-    if "lm_head.weight" not in hf_dict and "model.embed_tokens.weight" in hf_dict:
-        hf_dict["lm_head.weight"] = hf_dict["model.embed_tokens.weight"]
+    # If untied and lm_head was missing, fallback to cloning embed_tokens
+    if not tie_embeddings and "lm_head.weight" not in hf_dict and "model.embed_tokens.weight" in hf_dict:
+        hf_dict["lm_head.weight"] = hf_dict["model.embed_tokens.weight"].clone()
 
     return hf_dict
 
 
 def build_hf_config(cfg: ModelConfig) -> Dict[str, Any]:
     """Constructs a standard Hugging Face LLaMA-compatible config.json."""
+    tie_embeddings = getattr(cfg, "tie_word_embeddings", True)
     return {
         "architectures": ["LlamaForCausalLM"],
         "attention_bias": False,
@@ -115,7 +120,7 @@ def build_hf_config(cfg: ModelConfig) -> Dict[str, Any]:
         "rms_norm_eps": 1e-5,
         "rope_scaling": None,
         "rope_theta": getattr(cfg, "rope_theta", 10000.0),
-        "tie_word_embeddings": True,
+        "tie_word_embeddings": tie_embeddings,
         "torch_dtype": "bfloat16",
         "transformers_version": "4.44.0",
         "use_cache": True,
@@ -189,7 +194,9 @@ def convert_checkpoint_to_hf(
     # 4. Save SafeTensors
     weights_path = os.path.join(output_dir, "model.safetensors")
     save_file(hf_state_dict, weights_path, metadata={"format": "pt"})
+    total_params = sum(t.numel() for t in hf_state_dict.values())
     print(f"✓ Saved SafeTensors weights: {weights_path} ({os.path.getsize(weights_path) / (1024**2):.2f} MB)")
+    print(f"✓ Total SafeTensors Header Parameters: {total_params:,}")
 
     # 5. Save config.json
     hf_cfg = build_hf_config(cfg)
@@ -212,6 +219,6 @@ def convert_checkpoint_to_hf(
 
 
 if __name__ == "__main__":
-    ckpt_arg = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/dpo_127M/dpo_final.pt"
+    ckpt_arg = sys.argv[1] if len(sys.argv) > 1 else f"checkpoints/dpo_{get_model_tag()}/dpo_final.pt"
     out_arg = sys.argv[2] if len(sys.argv) > 2 else "hf_export"
     convert_checkpoint_to_hf(ckpt_arg, out_arg)

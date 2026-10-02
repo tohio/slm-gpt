@@ -1,3 +1,4 @@
+from transformer.env import get_model_tag
 """
 eval/evaluate.py: Native 5-Benchmark Evaluation Suite for slm-gpt.
 Evaluates:
@@ -605,7 +606,7 @@ def run_evaluation(
 
 if __name__ == "__main__":
     kwargs: Dict[str, Any] = {
-        "ckpt_path": "checkpoints/dpo_127M/dpo_final.pt",
+        "ckpt_path": f"checkpoints/dpo_{get_model_tag()}/dpo_final.pt",
         "val_shard": "data/pretrain/val_00000.bin",
         "dpo_path": "data/dpo/preference_pairs.jsonl",
         "limit": 200,

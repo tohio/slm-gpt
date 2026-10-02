@@ -1,3 +1,4 @@
+from transformer.env import get_model_tag, is_training_inference_enabled
 """
 dpo/train.py: Direct Preference Optimization execution engine for slm-gpt.
 Concatenated forward passes for high throughput, PyTorch 2.6+ safe globals,
@@ -39,9 +40,9 @@ warnings.filterwarnings("ignore", message=".*Argument aux_data.*cannot be conver
 @dataclass
 class DPOArgs:
     # Checkpoints & Data
-    sft_model_path: str = "checkpoints/sft_125M/best_sft_model.pt"
+    sft_model_path: str = f"checkpoints/sft_{get_model_tag()}/best_sft_model.pt"
     data_path: str = "data/dpo/preference_pairs.jsonl"
-    output_dir: str = "checkpoints/dpo_125M"
+    output_dir: str = f"checkpoints/dpo_{get_model_tag()}"
 
     # Tokenizer
     tokenizer_type: str = "tiktoken"

@@ -1,3 +1,4 @@
+from transformer.env import get_model_tag, is_training_inference_enabled
 """
 pretrain/train.py: Dynamic Distributed Pre-training Engine for slm-gpt.
 Supports Multi-GPU DDP via torchrun, bfloat16 mixed precision, FlashAttention,
@@ -247,7 +248,7 @@ def main():
     )
     model_cfg = runtime_cfg.model_cfg
     size_tag = runtime_cfg.size_tag
-    out_dir = args.output_dir or f"checkpoints/pretrain_{size_tag}"
+    out_dir = args.output_dir or f"checkpoints/pretrain_{size_tag or get_model_tag()}"
     os.makedirs(out_dir, exist_ok=True)
 
     # Resolve architectural fields defensively across schema variants

@@ -1,3 +1,4 @@
+from transformer.env import get_model_tag
 """
 cli_chat.py: Interactive command-line chat interface for slm-gpt.
 Supports multi-turn ChatML conversations, streaming token generation,
@@ -262,7 +263,7 @@ def run_chat(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive multi-turn CLI for slm-gpt.")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/dpo_127M/dpo_final.pt")
+    parser.add_argument("--checkpoint", type=str, default=f"checkpoints/dpo_{get_model_tag()}/dpo_final.pt")
     parser.add_argument("--tokenizer_type", type=str, default="tiktoken")
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=0.4)

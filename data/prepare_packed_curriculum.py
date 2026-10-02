@@ -1,10 +1,6 @@
 """
-data/prepare_packed_curriculum.py: High-Throughput Physical Token Interleaving.
-Features:
-  - Direct Rust multi-threaded tokenization via tiktoken with allowed_special="all".
-  - Zero-copy list buffering with single-pass uint16 shard conversion.
-  - Parameter-aware repetition capping across finite reasoning pools.
-  - Automatic dynamic Hugging Face dataset card generation.
+data/prepare_packed_curriculum.py: Multi-Scale Physical Token Interleaving Engine.
+Supports dynamic scaling across 125M, 350M, and 1B parameter configurations.
 """
 
 import glob
@@ -15,7 +11,6 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, Iterator, List, Optional
 
-# Ensure repository root is on sys.path regardless of execution context
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dotenv import load_dotenv
@@ -26,53 +21,67 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from tokenizer.factory import get_tokenizer
-
 from data.datacard import create_dataset_card
 
 
 # =====================================================================
-# 1. Dynamic Curriculum Weight & Repetition Capping
+# 1. Multi-Tier Scaling Logic
 # =====================================================================
 
 BASE_RATIOS = {
-    "FineWeb-Edu": 0.480,
-    "DCLM-Edu": 0.250,
-    "The Stack-Edu": 0.150,
-    "NuminaMath-CoT": 0.050,
-    "OpenMathReasoning": 0.040,
-    "SLM-Synthetic-Pretrain": 0.030,
+    # Infinite Foundations
+    "FineWeb-Edu":           0.420,  # 42.0% (General knowledge & prose)
+    "DCLM-Edu":              0.180,  # 18.0% (High-quality discourse)
+    "The-Stack-Filtered":    0.160,  # 16.0% (Verified raw Python repo text)
+
+    # Macro Reasoning Backbones (Finite unique pools)
+    "NuminaMath-CoT":        0.080,  #  8.0% (~220M unique pool)
+    "OpenMathReasoning":     0.060,  #  6.0% (~200M unique pool)
+
+    # Multi-Signal Synthetic Anchor (task_code, tracing, math, restraint)
+    "SLM-Synthetic-Pretrain": 0.100, # 10.0% baseline
 }
 
 FINITE_POOLS = {
     "NuminaMath-CoT": 220_000_000,
     "OpenMathReasoning": 200_000_000,
-    "SLM-Synthetic-Pretrain": 250_000_000,
 }
 
-INFINITE_SOURCES = ["FineWeb-Edu", "DCLM-Edu", "The Stack-Edu"]
+INFINITE_SOURCES = ["FineWeb-Edu", "DCLM-Edu", "The-Stack-Filtered"]
 
 
 def compute_curriculum_weights(total_tokens: int, param_count: int) -> Dict[str, float]:
-    """Calculates source weights enforcing safe repetition ceilings on finite pools."""
+    """
+    Dynamically scales the synthetic anchor and finite pools across model sizes:
+      - 125M (<200M params):  High synthetic anchor (10-12%) for circuit seeding.
+      - 350M (200M-600M params): Moderate anchor (8-10%) for balanced absorption.
+      - 1B   (>600M params):   Controlled anchor (4-6%) with macro repos dominating.
+    """
     if param_count < 200_000_000:
-        max_epochs = {"NuminaMath-CoT": 2.0, "OpenMathReasoning": 2.0, "SLM-Synthetic-Pretrain": 1.5}
+        synth_ratio = 0.110
+        math_cap_mult = 2.2
     elif param_count <= 600_000_000:
-        max_epochs = {"NuminaMath-CoT": 3.2, "OpenMathReasoning": 3.0, "SLM-Synthetic-Pretrain": 1.8}
+        synth_ratio = 0.090
+        math_cap_mult = 3.0
     else:
-        max_epochs = {"NuminaMath-CoT": 2.5, "OpenMathReasoning": 2.5, "SLM-Synthetic-Pretrain": 2.0}
+        synth_ratio = 0.050
+        math_cap_mult = 2.2
 
-    finite_tokens = {}
-    for name, pool in FINITE_POOLS.items():
-        desired = int(total_tokens * BASE_RATIOS[name])
-        ceiling = int(pool * max_epochs[name])
-        finite_tokens[name] = min(desired, ceiling)
+    # Calculate token budgets for finite math pools
+    numina_tokens = min(int(total_tokens * BASE_RATIOS["NuminaMath-CoT"]), int(FINITE_POOLS["NuminaMath-CoT"] * math_cap_mult))
+    openmath_tokens = min(int(total_tokens * BASE_RATIOS["OpenMathReasoning"]), int(FINITE_POOLS["OpenMathReasoning"] * math_cap_mult))
+    synth_tokens = int(total_tokens * synth_ratio)
 
-    rem_tokens = total_tokens - sum(finite_tokens.values())
-    inf_sum = sum(BASE_RATIOS[name] for name in INFINITE_SOURCES)
+    fixed_sum = numina_tokens + openmath_tokens + synth_tokens
+    rem_tokens = max(0, total_tokens - fixed_sum)
 
-    weights = {}
-    for name, count in finite_tokens.items():
-        weights[name] = count / total_tokens
+    # Distribute remaining tokens across infinite backbones
+    inf_sum = sum(BASE_RATIOS[s] for s in INFINITE_SOURCES)
+    weights = {
+        "SLM-Synthetic-Pretrain": synth_tokens / total_tokens,
+        "NuminaMath-CoT": numina_tokens / total_tokens,
+        "OpenMathReasoning": openmath_tokens / total_tokens,
+    }
 
     for name in INFINITE_SOURCES:
         share = (BASE_RATIOS[name] / inf_sum) * rem_tokens
@@ -82,30 +91,26 @@ def compute_curriculum_weights(total_tokens: int, param_count: int) -> Dict[str,
 
 
 # =====================================================================
-# 2. Fast Multithreaded Batch Tokenizer
+# 2. Fast Batch Tokenizer
 # =====================================================================
 
 def fast_encode_batch(tokenizer: Any, texts: List[str]) -> List[List[int]]:
-    """Encodes a list of strings directly via tiktoken Rust multi-threading."""
     if not texts:
         return []
-
     enc = getattr(tokenizer, "enc", None)
     if enc and hasattr(enc, "encode_batch"):
         try:
             return enc.encode_batch(texts, num_threads=16, allowed_special="all")
         except Exception:
             pass
-
     return [tokenizer.encode(t) for t in texts]
 
 
 # =====================================================================
-# 3. Stream Readers
+# 3. Stream Readers with Schema Safeguards
 # =====================================================================
 
 class SourceReader:
-    """Base reader interface for curriculum sources."""
     def __init__(self, name: str, weight: float):
         self.name = name
         self.weight = weight
@@ -115,7 +120,7 @@ class SourceReader:
 
 
 class FastParquetReader(SourceReader):
-    """Downloads parquet or jsonl shards locally via HF Hub and streams tokenized documents."""
+    """Streams tokenized documents with fail-fast schema verification."""
     def __init__(
         self,
         name: str,
@@ -123,74 +128,31 @@ class FastParquetReader(SourceReader):
         subset: Optional[str],
         text_key: str,
         weight: float,
+        data_dir: Optional[str] = None,
     ):
         super().__init__(name, weight)
         self.repo = repo
         self.subset = subset
         self.text_key = text_key
+        self.data_dir = data_dir
         self._target_files: Optional[List[str]] = None
 
     def _resolve_target_files(self, token: Optional[str]) -> List[str]:
         api = HfApi(token=token)
         try:
             files = api.list_repo_files(repo_id=self.repo, repo_type="dataset")
-            valid_files = [f for f in files if f.endswith((".parquet", ".jsonl", ".jsonl.gz"))]
-            if not valid_files:
-                return []
-
+            valid = [f for f in files if f.endswith((".parquet", ".jsonl", ".jsonl.gz"))]
+            if self.data_dir:
+                valid = [f for f in valid if f.startswith(self.data_dir.strip("/"))]
             if self.subset:
-                valid_files = [f for f in valid_files if self.subset in f]
-
-            parquets = [f for f in valid_files if f.endswith(".parquet")]
-            candidates = parquets if parquets else valid_files
+                valid = [f for f in valid if self.subset in f]
+            parquets = [f for f in valid if f.endswith(".parquet")]
+            candidates = parquets if parquets else valid
             candidates.sort()
             return candidates
         except Exception as e:
-            print(f"[{self.name}] Error checking files in {self.repo}: {e}")
+            print(f"[{self.name}] Error checking repo {self.repo}: {e}")
             return []
-
-    def _stream_from_jsonl(self, path: str, tokenizer) -> Iterator[List[int]]:
-        opener = gzip.open if path.endswith(".gz") else open
-        batch_texts: List[str] = []
-        batch_size = 2048
-
-        with opener(path, "rt", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    text_val = None
-                    if isinstance(data, str):
-                        text_val = data
-                    elif isinstance(data, dict):
-                        text_val = (
-                            data.get(self.text_key)
-                            or data.get("text")
-                            or data.get("content")
-                            or data.get("prompt")
-                        )
-                        if not text_val and "messages" in data and isinstance(data["messages"], list):
-                            text_val = "\n".join(
-                                f"{m.get('role', '')}: {m.get('content', '')}"
-                                for m in data["messages"]
-                                if isinstance(m, dict)
-                            )
-                    if text_val and isinstance(text_val, str) and len(text_val.strip()) > 0:
-                        batch_texts.append(text_val)
-                        if len(batch_texts) >= batch_size:
-                            for doc in fast_encode_batch(tokenizer, batch_texts):
-                                if doc:
-                                    yield doc
-                            batch_texts = []
-                except Exception:
-                    continue
-
-        if batch_texts:
-            for doc in fast_encode_batch(tokenizer, batch_texts):
-                if doc:
-                    yield doc
 
     def _stream_from_parquet(self, path: str, tokenizer) -> Iterator[List[int]]:
         pf = pq.ParquetFile(path)
@@ -198,16 +160,20 @@ class FastParquetReader(SourceReader):
 
         col_to_use = self.text_key if self.text_key in schema_cols else None
         if not col_to_use:
-            for candidate in ["text", "content", "prompt", "code"]:
+            for candidate in ["text", "content", "code", "solution"]:
                 if candidate in schema_cols:
                     col_to_use = candidate
                     break
+
         if not col_to_use:
-            col_to_use = schema_cols[0]
+            raise KeyError(
+                f"[{self.name}] FATAL: No text column found in {path}! "
+                f"Available: {schema_cols}. Refusing to fall back to metadata."
+            )
 
         for batch in pf.iter_batches(batch_size=2048, columns=[col_to_use]):
             raw_texts = batch[col_to_use].to_pylist()
-            valid_texts = [t for t in raw_texts if t and isinstance(t, str) and len(t.strip()) > 0]
+            valid_texts = [t for t in raw_texts if t and isinstance(t, str) and len(t.strip()) > 30]
             if not valid_texts:
                 continue
             for doc in fast_encode_batch(tokenizer, valid_texts):
@@ -219,9 +185,8 @@ class FastParquetReader(SourceReader):
         if self._target_files is None:
             self._target_files = self._resolve_target_files(token)
             if not self._target_files:
-                print(f"[{self.name}] No valid data files found in {self.repo}.")
-                return
-            print(f"[{self.name}] Resolved {len(self._target_files)} shard(s) in {self.repo}")
+                raise FileNotFoundError(f"[{self.name}] No valid data files resolved in {self.repo}")
+            print(f"[{self.name}] Resolved {len(self._target_files)} shard(s) from {self.repo}")
 
         for target_file in self._target_files:
             try:
@@ -232,106 +197,134 @@ class FastParquetReader(SourceReader):
                     token=token,
                 )
             except Exception as e:
-                print(f"[{self.name}] Error downloading shard {target_file}: {e}")
+                print(f"[{self.name}] Download failed for {target_file}: {e}")
                 continue
 
             try:
-                if local_path.endswith((".jsonl", ".jsonl.gz")):
-                    yield from self._stream_from_jsonl(local_path, tokenizer)
-                else:
-                    yield from self._stream_from_parquet(local_path, tokenizer)
+                yield from self._stream_from_parquet(local_path, tokenizer)
             except Exception as e:
-                print(f"[{self.name}] Error reading shard {local_path}: {e}")
+                print(f"[{self.name}] Error processing {local_path}: {e}")
 
 
-class ReasoningParquetReader(FastParquetReader):
-    """Specialized parquet reader that stitches problem/solution pairs into an envelope."""
-    def __init__(
-        self,
-        name: str,
-        repo: str,
-        subset: Optional[str],
-        problem_key: str,
-        solution_key: str,
-        weight: float,
-        wrap_think_tag: bool = False,
-    ):
-        super().__init__(name=name, repo=repo, subset=subset, text_key=problem_key, weight=weight)
-        self.problem_key = problem_key
-        self.solution_key = solution_key
-        self.wrap_think_tag = wrap_think_tag
+class FilteredRepoCodeReader(FastParquetReader):
+    """Streams Python source files from The Stack, filtering boilerplate in-flight."""
+    FORBIDDEN_KEYWORDS = [
+        "django.db", "rest_framework", "boto3", "flask", "conftest",
+        "alembic", "Auto-generated", "protobuf", "setup(", "argparse"
+    ]
 
     def _stream_from_parquet(self, path: str, tokenizer) -> Iterator[List[int]]:
         pf = pq.ParquetFile(path)
         schema_cols = pf.schema_arrow.names
 
-        prob_col = self.problem_key if self.problem_key in schema_cols else None
-        if not prob_col:
-            for candidate in ["problem", "question", "prompt", "instruction"]:
-                if candidate in schema_cols:
-                    prob_col = candidate
-                    break
+        if self.text_key not in schema_cols:
+            raise KeyError(f"[{self.name}] Missing '{self.text_key}' in {schema_cols}")
 
-        sol_col = self.solution_key if self.solution_key in schema_cols else None
-        if not sol_col:
-            for candidate in ["generated_solution", "solution", "response", "answer", "output"]:
-                if candidate in schema_cols:
-                    sol_col = candidate
-                    break
+        for batch in pf.iter_batches(batch_size=2048, columns=[self.text_key]):
+            raw_files = batch[self.text_key].to_pylist()
+            clean_texts = []
+            for code in raw_files:
+                if not code or not isinstance(code, str):
+                    continue
+                if len(code) < 200 or len(code) > 25000:
+                    continue
+                if "def " not in code:
+                    continue
+                if not any(k in code for k in ["for ", "while ", "if "]):
+                    continue
+                if any(bad in code for bad in self.FORBIDDEN_KEYWORDS):
+                    continue
+                clean_texts.append(code.strip())
 
-        if not prob_col or not sol_col:
-            print(f"[{self.name}] Required columns not found in {path}. Columns: {schema_cols}")
-            return
+            if clean_texts:
+                for doc in fast_encode_batch(tokenizer, clean_texts):
+                    if doc:
+                        yield doc
 
-        for batch in pf.iter_batches(batch_size=2048, columns=[prob_col, sol_col]):
-            probs = batch[prob_col].to_pylist()
-            sols = batch[sol_col].to_pylist()
-            docs: List[str] = []
+
+class JSONLStreamReader(SourceReader):
+    """Streams JSONL/JSONL.gz datasets (e.g., tohio/slm-synthetic-pretrain)."""
+    def __init__(self, name: str, repo: str, weight: float, text_key: str = "text"):
+        super().__init__(name, weight)
+        self.repo = repo
+        self.text_key = text_key
+        self._target_files: Optional[List[str]] = None
+
+    def _resolve_files(self, token: Optional[str]) -> List[str]:
+        api = HfApi(token=token)
+        files = api.list_repo_files(repo_id=self.repo, repo_type="dataset")
+        return [f for f in files if f.endswith((".jsonl", ".jsonl.gz"))]
+
+    def stream_docs(self, tokenizer) -> Iterator[List[int]]:
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if self._target_files is None:
+            self._target_files = self._resolve_files(token)
+            print(f"[{self.name}] Resolved {len(self._target_files)} JSONL file(s)")
+
+        for f in self._target_files:
+            local_path = hf_hub_download(repo_id=self.repo, filename=f, repo_type="dataset", token=token)
+            opener = gzip.open if local_path.endswith(".gz") else open
+            buffer = []
+
+            with opener(local_path, "rt", encoding="utf-8") as file_in:
+                for line in file_in:
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                        text = record.get(self.text_key, "").strip()
+                        if text:
+                            buffer.append(text)
+                    except Exception:
+                        continue
+
+                    if len(buffer) >= 2048:
+                        for doc in fast_encode_batch(tokenizer, buffer):
+                            if doc:
+                                yield doc
+                        buffer = []
+
+            if buffer:
+                for doc in fast_encode_batch(tokenizer, buffer):
+                    if doc:
+                        yield doc
+
+
+class ReasoningParquetReader(FastParquetReader):
+    """Stitches mathematical problems and reasoning solutions into formatted text."""
+    def __init__(self, name: str, repo: str, problem_key: str, solution_key: str, weight: float, wrap_think: bool = False):
+        super().__init__(name=name, repo=repo, subset=None, text_key=problem_key, weight=weight)
+        self.problem_key = problem_key
+        self.solution_key = solution_key
+        self.wrap_think = wrap_think
+
+    def _stream_from_parquet(self, path: str, tokenizer) -> Iterator[List[int]]:
+        pf = pq.ParquetFile(path)
+        schema_cols = pf.schema_arrow.names
+
+        p_col = self.problem_key if self.problem_key in schema_cols else "problem"
+        s_col = self.solution_key if self.solution_key in schema_cols else "solution"
+
+        if p_col not in schema_cols or s_col not in schema_cols:
+            raise KeyError(f"[{self.name}] Missing keys in {schema_cols}")
+
+        for batch in pf.iter_batches(batch_size=2048, columns=[p_col, s_col]):
+            probs = batch[p_col].to_pylist()
+            sols = batch[s_col].to_pylist()
+            docs = []
             for p, s in zip(probs, sols):
                 if not (p and s and isinstance(p, str) and isinstance(s, str)):
                     continue
-                p_clean = p.strip()
-                s_clean = s.strip()
-                if not p_clean or not s_clean:
+                p_c, s_c = p.strip(), s.strip()
+                if not p_c or not s_c:
                     continue
-
-                if self.wrap_think_tag and "<think>" not in s_clean:
-                    sol_formatted = f"<think>\n{s_clean}\n</think>"
-                else:
-                    sol_formatted = s_clean
-
-                docs.append(f"Problem:\n{p_clean}\n\nSolution:\n{sol_formatted}")
+                sol_fmt = f"<think>\n{s_c}\n</think>" if (self.wrap_think and "<think>" not in s_c) else s_c
+                docs.append(f"Problem:\n{p_c}\n\nSolution:\n{sol_fmt}")
 
             if docs:
                 for doc in fast_encode_batch(tokenizer, docs):
                     if doc:
                         yield doc
-
-
-class LocalBinReader(SourceReader):
-    """Reads pre-tokenized documents from local .bin files."""
-    def __init__(self, name: str, directory: str, weight: float, eot_token_id: int, dtype: np.dtype = np.uint16):
-        super().__init__(name, weight)
-        self.directory = directory
-        self.eot_token_id = eot_token_id
-        self.dtype = dtype
-
-    def stream_docs(self, tokenizer) -> Iterator[List[int]]:
-        shard_files = sorted(glob.glob(os.path.join(self.directory, "*.bin")))
-        if not shard_files:
-            return
-
-        for sf in shard_files:
-            tokens = np.fromfile(sf, dtype=self.dtype)
-            eot_indices = np.where(tokens == self.eot_token_id)[0]
-            start = 0
-            for idx in eot_indices:
-                doc = tokens[start:idx].tolist()
-                if doc:
-                    yield doc
-                start = idx + 1
-            if start < len(tokens):
-                yield tokens[start:].tolist()
 
 
 # =====================================================================
@@ -341,76 +334,65 @@ class LocalBinReader(SourceReader):
 def pack_curriculum_to_shards(
     sources: List[SourceReader],
     output_dir: str = "data/pretrain",
-    total_token_budget: int = 2_000_000_000,
+    total_token_budget: int = 10_000_000_000,
     shard_size_tokens: int = 25_000_000,
     val_tokens: Optional[int] = None,
     tokenizer_type: str = "tiktoken",
     tokenizer_path: Optional[str] = None,
 ):
-    """Physically packs multiple sources into contiguous .bin files using token-deficit scheduling."""
     os.makedirs(output_dir, exist_ok=True)
     tokenizer = get_tokenizer(tokenizer_type, tokenizer_path)
     eot_id = tokenizer.eot_id
 
     if val_tokens is None:
-        val_tokens = max(50_000, min(1_000_000, total_token_budget // 200))
+        val_tokens = max(50_000, min(2_000_000, total_token_budget // 200))
 
     raw_weights = [s.weight for s in sources]
-    total_weight = sum(raw_weights)
-    target_proportions = [w / total_weight for w in raw_weights]
+    total_w = sum(raw_weights)
+    target_proportions = [w / total_w for w in raw_weights]
     num_sources = len(sources)
 
-    print("=" * 75)
-    print("      slm-gpt Physical Token Packing Engine (High-Throughput Streamer)")
-    print("=" * 75)
-    print(f"Total Train Target:  {total_token_budget:,} tokens")
+    print("=" * 80)
+    print("      Unified Physical Token Packing Engine (125M / 350M / 1B)")
+    print("=" * 80)
+    print(f"Total Target Budget: {total_token_budget:,} tokens")
     print(f"Validation Target:   {val_tokens:,} tokens")
-    print(f"Shard Size:          {shard_size_tokens:,} tokens ({shard_size_tokens * 2 / (1024**2):.1f} MB in uint16)")
+    print(f"Shard Size:          {shard_size_tokens:,} tokens")
     print(f"Output Directory:    {output_dir}")
-    print("Target Curriculum:")
+    print("Curriculum Allocation:")
     for s, p in zip(sources, target_proportions):
         print(f"  • {s.name:<25} {p * 100:>5.1f}% ({int(p * total_token_budget):,} tokens)")
-    print("=" * 75)
+    print("=" * 80)
 
     generators = [s.stream_docs(tokenizer) for s in sources]
     tokens_per_source = [0] * num_sources
 
-    # 1. Harvest validation partition first
-    print("\nExtracting validation partition...")
-    val_buffer: List[int] = []
-    source_idx = 0
-    last_val_log = 0
-
+    # 1. Harvest validation partition
+    print("\nHarvesting validation partition...")
+    val_buffer = []
+    src_idx = 0
     while len(val_buffer) < val_tokens:
         try:
-            doc = next(generators[source_idx % num_sources])
+            doc = next(generators[src_idx % num_sources])
             val_buffer.extend(doc)
             val_buffer.append(eot_id)
         except StopIteration:
-            generators[source_idx % num_sources] = sources[source_idx % num_sources].stream_docs(tokenizer)
-        source_idx += 1
-
-        if len(val_buffer) - last_val_log >= max(10_000, val_tokens // 5):
-            pct = (len(val_buffer) / val_tokens) * 100
-            print(f"  [Validation] Packed {len(val_buffer):,} / {val_tokens:,} tokens ({pct:.1f}%)")
-            last_val_log = len(val_buffer)
+            generators[src_idx % num_sources] = sources[src_idx % num_sources].stream_docs(tokenizer)
+        src_idx += 1
 
     val_data = np.array(val_buffer[:val_tokens], dtype=np.uint16)
     val_file = os.path.join(output_dir, "val_00000.bin")
     val_data.tofile(val_file)
-    print(f"✓ Wrote validation shard: {val_file} ({len(val_data):,} tokens, {os.path.getsize(val_file)/(1024*1024):.2f} MB)")
+    print(f"✓ Validation shard complete: {val_file} ({len(val_data):,} tokens)")
 
-    # 2. Pack Training Shards
-    print("\nPacking training partition...")
-    token_buffer: List[int] = []
+    # 2. Deficit-based training harvest
+    print("\nPacking training shards...")
+    token_buffer = []
     shard_idx = 0
-    total_tokens_written = 0
-    last_train_log = 0
+    total_written = 0
 
-    while total_tokens_written + len(token_buffer) < total_token_budget:
+    while total_written + len(token_buffer) < total_token_budget:
         total_so_far = max(1, sum(tokens_per_source))
-
-        # Pure-Python deficit check
         best_i = 0
         max_deficit = -1e9
         for i in range(num_sources):
@@ -418,114 +400,61 @@ def pack_curriculum_to_shards(
             if defic > max_deficit:
                 max_deficit = defic
                 best_i = i
-        chosen_idx = best_i
 
+        chosen = best_i
         try:
-            doc_tokens = next(generators[chosen_idx])
+            doc = next(generators[chosen])
         except StopIteration:
-            generators[chosen_idx] = sources[chosen_idx].stream_docs(tokenizer)
+            generators[chosen] = sources[chosen].stream_docs(tokenizer)
             try:
-                doc_tokens = next(generators[chosen_idx])
+                doc = next(generators[chosen])
             except StopIteration:
                 continue
 
-        token_buffer.extend(doc_tokens)
+        token_buffer.extend(doc)
         token_buffer.append(eot_id)
-        tokens_per_source[chosen_idx] += len(doc_tokens) + 1
-
-        total_current = total_tokens_written + len(token_buffer)
-        if total_current - last_train_log >= max(50_000, total_token_budget // 20):
-            pct = (total_current / total_token_budget) * 100
-            print(f"  [Training] Packed {total_current:,} / {total_token_budget:,} tokens ({pct:.1f}%)")
-            last_train_log = total_current
+        tokens_per_source[chosen] += len(doc) + 1
 
         while len(token_buffer) >= shard_size_tokens:
             shard_data = np.array(token_buffer[:shard_size_tokens], dtype=np.uint16)
             out_file = os.path.join(output_dir, f"train_{shard_idx:05d}.bin")
             shard_data.tofile(out_file)
 
-            total_tokens_written += shard_size_tokens
+            total_written += shard_size_tokens
             token_buffer = token_buffer[shard_size_tokens:]
-            pct = (total_tokens_written / total_token_budget) * 100
-            print(f"✓ Wrote {out_file} | Total: {total_tokens_written:,} / {total_token_budget:,} tokens ({pct:.1f}%)")
+            pct = (total_written / total_token_budget) * 100
+            print(f"✓ Wrote {out_file} | Total: {total_written:,} / {total_token_budget:,} ({pct:.1f}%)")
             shard_idx += 1
 
-            if total_tokens_written >= total_token_budget:
+            if total_written >= total_token_budget:
                 break
 
-    # Remainder shard
-    if token_buffer and total_tokens_written < total_token_budget:
+    if token_buffer and total_written < total_token_budget:
         shard_data = np.array(token_buffer, dtype=np.uint16)
         out_file = os.path.join(output_dir, f"train_{shard_idx:05d}.bin")
         shard_data.tofile(out_file)
-        total_tokens_written += len(shard_data)
-        shard_idx += 1
-        print(f"✓ Wrote final remainder shard: {out_file} | Total: {total_tokens_written:,} tokens ({os.path.getsize(out_file)/(1024*1024):.2f} MB)")
+        total_written += len(shard_data)
+        print(f"✓ Final shard written: {out_file} ({len(shard_data):,} tokens)")
 
-    print("=" * 75)
-    print(f"Physical packing complete. Total train tokens: {total_tokens_written:,}")
-    print("=" * 75)
-
-    # 3. Dynamic Dataset Card Generation
-    source_stats = {}
-    for s, count in zip(sources, tokens_per_source):
-        repo = getattr(s, "repo", getattr(s, "directory", "Custom"))
-        status = "100% Unique"
-        if s.name in FINITE_POOLS:
-            epochs = count / FINITE_POOLS[s.name]
-            status = f"{epochs:.2f}× Repetition Ceiling" if epochs > 1.0 else "100% Unique"
-
-        source_stats[s.name] = {
-            "upstream": repo,
-            "tokens": count,
-            "status": status,
-        }
-
-    dataset_name = f"slm-curriculum-{max(1, int(round(total_tokens_written / 1e9)))}b"
-
-    create_dataset_card(
-        output_dir=output_dir,
-        dataset_name=dataset_name,
-        total_tokens=total_tokens_written,
-        shard_count=shard_idx,
-        tokens_per_shard=shard_size_tokens,
-        source_stats=source_stats,
-        val_tokens=len(val_data),
-        tokenizer_type=tokenizer_type,
-        vocab_size=getattr(tokenizer, "vocab_size", 50257),
-        eot_token_id=eot_id,
-        special_tokens=getattr(tokenizer, "special_tokens", None),
-    )
+    print(f"\nAll shards generated. Total training tokens: {total_written:,}")
 
 
-def build_default_curriculum(
-    total_tokens: int = 2_000_000_000,
-    param_count: int = 126_758_400,
-    upstream_dir: Optional[str] = None
-) -> List[SourceReader]:
-    if upstream_dir and os.path.exists(upstream_dir):
-        return [
-            LocalBinReader("Local Curated Shards", upstream_dir, weight=0.98, eot_token_id=50256, dtype=np.uint16),
-            FastParquetReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=0.02),
-        ]
-
+def build_curriculum(total_tokens: int, param_count: int) -> List[SourceReader]:
     w = compute_curriculum_weights(total_tokens=total_tokens, param_count=param_count)
-
     return [
         FastParquetReader("FineWeb-Edu", "HuggingFaceFW/fineweb-edu", "sample/100BT", "text", weight=w["FineWeb-Edu"]),
         FastParquetReader("DCLM-Edu", "HuggingFaceTB/dclm-edu", None, "text", weight=w["DCLM-Edu"]),
-        FastParquetReader("The Stack-Edu", "HuggingFaceTB/smollm-corpus", "python-edu", "content", weight=w["The Stack-Edu"]),
-        ReasoningParquetReader("OpenMathReasoning", "nvidia/OpenMathReasoning", None, "problem", "generated_solution", weight=w["OpenMathReasoning"], wrap_think_tag=False),
-        ReasoningParquetReader("NuminaMath-CoT", "AI-MO/NuminaMath-CoT", None, "problem", "solution", weight=w["NuminaMath-CoT"], wrap_think_tag=True),
-        FastParquetReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", None, "text", weight=w["SLM-Synthetic-Pretrain"]),
+        FilteredRepoCodeReader("The-Stack-Filtered", "bigcode/the-stack-dedup", None, "content", weight=w["The-Stack-Filtered"], data_dir="data/python"),
+        ReasoningParquetReader("OpenMathReasoning", "nvidia/OpenMathReasoning", "problem", "generated_solution", weight=w["OpenMathReasoning"]),
+        ReasoningParquetReader("NuminaMath-CoT", "AI-MO/NuminaMath-CoT", "problem", "solution", weight=w["NuminaMath-CoT"], wrap_think=True),
+        JSONLStreamReader("SLM-Synthetic-Pretrain", "tohio/slm-synthetic-pretrain", weight=w["SLM-Synthetic-Pretrain"], text_key="text"),
     ]
 
 
 if __name__ == "__main__":
-    tokens_target = 2_000_000_000
-    param_target = 126_758_400
+    tokens_target = 10_000_000_000
+    param_target = 350_000_000
     shard_size = 25_000_000
-    custom_dir = None
     target_out = "data/pretrain"
     val_budget = None
 
@@ -534,21 +463,14 @@ if __name__ == "__main__":
             tokens_target = int(arg.split("=")[1])
         elif arg.startswith("params=") or arg.startswith("param_count="):
             param_target = int(arg.split("=")[1])
-        elif arg.startswith("shard_size=") or arg.startswith("shard_size_tokens="):
+        elif arg.startswith("shard_size="):
             shard_size = int(arg.split("=")[1])
-        elif arg.startswith("upstream_dir="):
-            custom_dir = arg.split("=")[1]
         elif arg.startswith("output_dir="):
             target_out = arg.split("=")[1]
         elif arg.startswith("val_tokens="):
             val_budget = int(arg.split("=")[1])
 
-    curriculum = build_default_curriculum(
-        total_tokens=tokens_target,
-        param_count=param_target,
-        upstream_dir=custom_dir,
-    )
-
+    curriculum = build_curriculum(total_tokens=tokens_target, param_count=param_target)
     pack_curriculum_to_shards(
         sources=curriculum,
         output_dir=target_out,

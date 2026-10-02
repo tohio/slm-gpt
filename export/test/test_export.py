@@ -38,20 +38,34 @@ def test_remap_state_dict_llama():
     model = DecoderOnlyTransformer(cfg)
     sd = model.state_dict()
 
-    hf_sd = remap_state_dict_to_hf_llama(sd, cfg)
+    # 1. Tied embeddings (default): lm_head.weight omitted
+    hf_sd_tied = remap_state_dict_to_hf_llama(sd, cfg)
+    assert "model.embed_tokens.weight" in hf_sd_tied
+    assert "lm_head.weight" not in hf_sd_tied
+    assert "model.norm.weight" in hf_sd_tied
+    assert "model.layers.0.input_layernorm.weight" in hf_sd_tied
+    assert "model.layers.0.self_attn.q_proj.weight" in hf_sd_tied
+    assert "model.layers.0.self_attn.k_proj.weight" in hf_sd_tied
+    assert "model.layers.0.self_attn.v_proj.weight" in hf_sd_tied
+    assert "model.layers.0.self_attn.o_proj.weight" in hf_sd_tied
+    assert "model.layers.0.mlp.gate_proj.weight" in hf_sd_tied
+    assert "model.layers.0.mlp.up_proj.weight" in hf_sd_tied
+    assert "model.layers.0.mlp.down_proj.weight" in hf_sd_tied
 
-    # Invariants: standard LLaMA naming
-    assert "model.embed_tokens.weight" in hf_sd
-    assert "lm_head.weight" in hf_sd
-    assert "model.norm.weight" in hf_sd
-    assert "model.layers.0.input_layernorm.weight" in hf_sd
-    assert "model.layers.0.self_attn.q_proj.weight" in hf_sd
-    assert "model.layers.0.self_attn.k_proj.weight" in hf_sd
-    assert "model.layers.0.self_attn.v_proj.weight" in hf_sd
-    assert "model.layers.0.self_attn.o_proj.weight" in hf_sd
-    assert "model.layers.0.mlp.gate_proj.weight" in hf_sd
-    assert "model.layers.0.mlp.up_proj.weight" in hf_sd
-    assert "model.layers.0.mlp.down_proj.weight" in hf_sd
+    # 2. Untied embeddings: lm_head.weight must be explicitly preserved
+    cfg_untied = ModelConfig(
+        vocab_size=1024,
+        max_seq_len=128,
+        d_model=192,
+        n_layers=2,
+        n_heads=3,
+        n_kv_heads=1,
+        d_ffn=512,
+        dropout=0.0,
+    )
+    setattr(cfg_untied, "tie_word_embeddings", False)
+    hf_sd_untied = remap_state_dict_to_hf_llama(sd, cfg_untied)
+    assert "lm_head.weight" in hf_sd_untied
 
 
 def test_end_to_end_safetensors_conversion(temp_export_dir):
@@ -95,10 +109,11 @@ def test_end_to_end_safetensors_conversion(temp_export_dir):
         assert c["hidden_size"] == 192
         assert c["tie_word_embeddings"] is True
 
-    # Verify SafeTensors integrity
+    # Verify SafeTensors integrity: lm_head must NOT be present when tied
     with safe_open(os.path.join(out_dir, "model.safetensors"), framework="pt") as f:
         keys = f.keys()
         assert "model.embed_tokens.weight" in keys
+        assert "lm_head.weight" not in keys
         tensor = f.get_tensor("model.embed_tokens.weight")
         assert tensor.dtype == torch.bfloat16
 

@@ -1,3 +1,4 @@
+from transformer.env import get_model_tag, is_training_inference_enabled
 """
 sft/train.py: Supervised Fine-Tuning execution engine for slm-gpt.
 
@@ -52,8 +53,8 @@ class SFTArgs:
     # Model & Data Paths
     data_path: str = "data/sft/train_sft.jsonl"
     val_path: Optional[str] = "data/sft/val_sft.jsonl"
-    pretrained_ckpt: str = "checkpoints/pretrain_125M/best_model.pt"
-    output_dir: str = "checkpoints/sft_125M"
+    pretrained_ckpt: str = f"checkpoints/pretrain_{get_model_tag()}/best_model.pt"
+    output_dir: str = f"checkpoints/sft_{get_model_tag()}"
 
     # Tokenizer
     tokenizer_type: str = "tiktoken"
@@ -133,6 +134,9 @@ def log_sample_generations(
 
     im_end_str = "<|im_end|>"
     use_autocast = (device == "cuda") and (compute_dtype in (torch.float16, torch.bfloat16))
+    if not is_training_inference_enabled():
+        print("  [Eval Inference] Skipped: TRAINING_INFERENCE=false in .env")
+        return
 
     with torch.amp.autocast(device_type="cuda", dtype=compute_dtype, enabled=use_autocast):
         for i, user_prompt in enumerate(EVAL_PROMPTS, start=1):
