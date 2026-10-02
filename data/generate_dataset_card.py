@@ -64,9 +64,9 @@ The dataset is serialized as high-throughput, raw binary token shards (`uint16`)
 | Domain | Source / Pipeline | Share (%) | Repetition Ceiling | Description |
 | :--- | :--- | :---: | :---: | :--- |
 | **General Web & Knowledge** | `FineWeb-Edu` + `DCLM-Edu` | {web_pct} | 1.0x (Infinite stream) | Syntactically and educationally filtered expository text. |
-| **Clean Repository Code** | `The-Stack-Edu` / Python Repositories | {code_pct} | $\le$ 1.5x | AST-validated, parseable Python code covering algorithms, typing, and standard libraries. |
-| **Reasoning & Math** | OpenMath / Synthetic Reasoning | {math_pct} | $\le$ 2.0x | Step-by-step verified arithmetic, algebraic proofs, and execution traces. |
-| **Synthetic Anchor** | `tohio/slm-synthetic-pretrain` | {anchor_pct} | $\le$ 2.0x | 5-signal dense anchor regulating high-entropy failure modes. |
+| **Clean Repository Code** | `The-Stack-Edu` / Python Repositories | {code_pct} | $\\le$ 1.5x | AST-validated, parseable Python code covering algorithms, typing, and standard libraries. |
+| **Reasoning & Math** | OpenMath / Synthetic Reasoning | {math_pct} | $\\le$ 2.0x | Step-by-step verified arithmetic, algebraic proofs, and execution traces. |
+| **Synthetic Anchor** | `tohio/slm-synthetic-pretrain` | {anchor_pct} | $\\le$ 2.0x | 5-signal dense anchor regulating high-entropy failure modes. |
 
 ### 5-Signal Synthetic Anchor Distribution
 The {anchor_pct} synthetic anchor enforces structural convergence across five targeted signals:
