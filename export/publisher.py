@@ -256,7 +256,7 @@ def generate_model_card(
         stage_desc,
         "",
         "## Architecture Highlights",
-        f"- **Parameters:** ~{param_display} ({n_layers} layers, hidden dimension $d_{{model}} = {d_model}$)",
+        f"- **Parameters:** ~{param_display} ({n_layers} layers, hidden dimension `d_model = {d_model}`)",
         f"- **Attention:** {attn_desc}",
         f"- **Activation:** SwiGLU Feed-Forward Network (`d_ffn = {d_ffn}`)",
         "- **Positional Encoding:** Rotary Position Embeddings (RoPE)",
@@ -337,7 +337,6 @@ def publish_to_hub(
 
     api = HfApi(token=api_token)
 
-    # 1. Inspect Checkpoint for Architecture, Params, and Meta
     print("=" * 65)
     print(f"--- Exporting Checkpoint for Hugging Face Hub: {repo_id} ---")
     if not os.path.exists(checkpoint_path):
@@ -359,7 +358,16 @@ def publish_to_hub(
         or ckpt_data.get("model")
         or (ckpt_data if isinstance(ckpt_data, dict) and "state_dict" not in ckpt_data else ckpt_data.get("state_dict", {}))
     )
-    num_params = sum(p.numel() for p in model_state.values()) if isinstance(model_state, dict) else 0
+
+    # Deduplicate tied output head / embedding weights
+    has_wte = any(k.endswith("wte.weight") or k.endswith("embed_tokens.weight") for k in model_state.keys())
+    num_params = 0
+    if isinstance(model_state, dict):
+        for k, v in model_state.items():
+            if has_wte and (k.endswith("lm_head.weight") or k == "lm_head.weight"):
+                continue
+            if hasattr(v, "numel"):
+                num_params += v.numel()
 
     # Auto-load eval_results.json if located in the checkpoint directory
     metrics = eval_metrics
@@ -373,7 +381,7 @@ def publish_to_hub(
             except Exception:
                 pass
 
-    # 2. Convert to SafeTensors & HF Artifacts
+    # 1. Convert to SafeTensors & HF Artifacts
     convert_checkpoint_to_hf(
         checkpoint_path=checkpoint_path,
         output_dir=export_dir,
@@ -381,7 +389,7 @@ def publish_to_hub(
         tokenizer_path=tokenizer_path,
     )
 
-    # 3. Generate Dynamic Model Card
+    # 2. Generate Dynamic Model Card
     readme_content = generate_model_card(
         repo_id=repo_id,
         config=cfg,
@@ -396,7 +404,7 @@ def publish_to_hub(
         f.write(readme_content)
     print(f"✓ Generated Dynamic Model Card: {export_dir}/README.md")
 
-    # 4. Upload to Hugging Face Hub
+    # 3. Upload to Hugging Face Hub
     print(f"Creating / verifying repo '{repo_id}' on Hugging Face Hub...")
     create_repo(repo_id, token=api_token, private=private, exist_ok=True)
 
