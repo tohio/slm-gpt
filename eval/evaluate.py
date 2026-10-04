@@ -1,17 +1,19 @@
-from transformer.env import get_model_tag
 """
 eval/evaluate.py: Native 5-Benchmark Evaluation Suite for slm-gpt.
 Evaluates:
   1. Perplexity (val_ppl): Exact token-level cross-entropy on packed uint16 shards.
   2. Commonsense QA (hellaswag, arc_easy): Length-normalized log-likelihood ranking.
   3. Step-by-Step Reasoning (gsm8k): Autoregressive generation with <think> tag & answer checking.
-  4. Code Execution (mbpp): Python generation validated against unit test assertions.
+  4. Code Execution (mbpp): Python generation validated against unit test assertions in isolated processes.
   5. Alignment Margin (dpo_margin): Chosen vs rejected log-likelihood delta verification.
 """
 
 import ast
+import contextlib
+import io
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -40,6 +42,7 @@ import torch.nn.functional as F
 
 from tokenizer.factory import get_tokenizer
 from transformer.config import ModelConfig
+from transformer.env import get_model_tag
 from transformer.model import DecoderOnlyTransformer as Transformer
 
 
@@ -363,7 +366,6 @@ def eval_gsm8k(
             next_tok = int(torch.argmax(logits[0, -1, :]).item())
             curr_ids.append(next_tok)
 
-            # Clean exit on either <|endoftext|> or <|im_end|>
             if next_tok in stop_tokens:
                 break
 
@@ -395,6 +397,27 @@ def eval_gsm8k(
 # Task 4: Code Generation & Execution (MBPP Sanitized)
 # =====================================================================
 
+def _execute_code_isolated(code_body: str, test_cases: List[str], result_queue: multiprocessing.Queue):
+    """Executes untrusted generated code with mocked IO in a child process."""
+    fake_env = {
+        "__builtins__": {
+            **__builtins__.__dict__ if hasattr(__builtins__, "__dict__") else __builtins__,
+            "input": lambda *args: "0",  # Guard against interactive stdin blocks
+        }
+    }
+
+    # Silence all stdout/stderr from model code execution
+    null_stream = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(null_stream), contextlib.redirect_stderr(null_stream):
+            exec(code_body, fake_env, fake_env)
+            for test in test_cases:
+                exec(test, fake_env, fake_env)
+        result_queue.put(True)
+    except Exception:
+        result_queue.put(False)
+
+
 @torch.no_grad()
 def eval_mbpp(
     model: Transformer,
@@ -410,7 +433,7 @@ def eval_mbpp(
             ds = load_dataset("Muennighoff/mbpp", "sanitized", split="test")
         except Exception as e:
             print(f"  ⚠️ Error loading MBPP: {e}")
-            return {"mbpp_pass@1": float("nan")}
+            return {"mbpp_pass@1": float("nan"), "syntax_validity": float("nan")}
 
     passed = 0
     syntax_valid = 0
@@ -441,7 +464,6 @@ def eval_mbpp(
             next_tok = int(torch.argmax(logits[0, -1, :]).item())
             curr_ids.append(next_tok)
 
-            # Clean exit on either <|endoftext|> or <|im_end|>
             if next_tok in stop_tokens:
                 break
 
@@ -457,15 +479,20 @@ def eval_mbpp(
 
         is_pass = False
         if is_syntactic and test_cases:
-            try:
-                env: Dict[str, Any] = {}
-                exec(code_body, env, env)
-                all_tests_passed = True
-                for test in test_cases:
-                    exec(test, env, env)
-                is_pass = all_tests_passed
-            except Exception:
+            q: multiprocessing.Queue = multiprocessing.Queue()
+            p = multiprocessing.Process(
+                target=_execute_code_isolated,
+                args=(code_body, test_cases, q),
+            )
+            p.start()
+            p.join(timeout=2.0)  # Hard 2.0-second timeout per problem
+
+            if p.is_alive():
+                p.terminate()
+                p.join()
                 is_pass = False
+            elif not q.empty():
+                is_pass = q.get()
 
         if is_pass:
             passed += 1
@@ -494,7 +521,7 @@ def eval_dpo_margin(
 ) -> Dict[str, Any]:
     print(f"  • Running DPO Alignment Margin Check ({limit:,} pairs)...")
     if not os.path.exists(dpo_file):
-        print(f"  ⚠️️ DPO file '{dpo_file}' not found. Skipping.")
+        print(f"  ⚠ DPO file '{dpo_file}' not found. Skipping.")
         return {"dpo_pref_acc": float("nan"), "mean_margin": float("nan")}
 
     pairs = []
