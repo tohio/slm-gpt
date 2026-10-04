@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -34,6 +34,34 @@ from transformer.config import ModelConfig as TransformerConfig
 
 import warnings
 warnings.filterwarnings("ignore", message=".*Argument aux_data.*cannot be converted to a JitArgument.*")
+
+
+def parse_token_string(val: Optional[Union[str, int, float]]) -> Optional[int]:
+    """
+    Parses human-readable token strings like '5B', '14B', '500M', '500k', 
+    or raw integers into exact integer token counts.
+    """
+    if val is None or str(val).strip().lower() in ("none", ""):
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip().replace("_", "").upper()
+    multipliers = {
+        "K": 1_000,
+        "M": 1_000_000,
+        "B": 1_000_000_000,
+        "T": 1_000_000_000_000,
+    }
+    for suffix, mult in multipliers.items():
+        if s.endswith(suffix):
+            try:
+                return int(float(s[:-len(suffix)]) * mult)
+            except ValueError:
+                break
+    try:
+        return int(float(s))
+    except ValueError:
+        raise ValueError(f"Unable to parse token budget string: '{val}'")
 
 
 class DistributedShardedDataLoader:
@@ -67,6 +95,16 @@ class DistributedShardedDataLoader:
             single = os.path.join(data_dir, f"{split}.bin")
             if os.path.exists(single):
                 self.shards = [single]
+
+        # Resilient fallback: If no val shards exist, reserve the last training shard
+        if not self.shards and split == "val":
+            train_shards = sorted(glob.glob(os.path.join(data_dir, "train_*.bin")))
+            if train_shards:
+                self.shards = [train_shards[-1]]
+                if process_rank == 0:
+                    print(f"[DataLoader] Notice: No 'val_*.bin' shards found in '{data_dir}'. "
+                          f"Using '{os.path.basename(self.shards[0])}' for validation.")
+
         if not self.shards:
             raise FileNotFoundError(f"No binary token shards found for split '{split}' in '{data_dir}'")
 
@@ -129,9 +167,10 @@ class DistributedShardedDataLoader:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="slm-gpt Dynamic Distributed Pre-training Engine")
-    parser.add_argument("kv_args", nargs="*", help="Key-value arguments like size=125M max_steps=2")
+    parser.add_argument("kv_args", nargs="*", help="Key-value arguments like size=125M tokens=5B max_steps=38146")
     parser.add_argument("--size", type=str, default="125M")
-    parser.add_argument("--data_dir", type=str, default="data/pretrain")
+    parser.add_argument("--tokens", type=str, default=None, help="Target token budget, e.g. 5B, 14B, 500M, or raw integer")
+    parser.add_argument("--data_dir", type=str, default=os.getenv("DATA_DIR", "data/pretrain"))
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--tokenizer_type", type=str, default="tiktoken")
     parser.add_argument("--tokenizer_path", type=str, default=None)
@@ -238,7 +277,12 @@ def main():
     device_type = "cuda" if "cuda" in device else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
-    # 2. Tokenizer & Dynamic Scaling Configuration
+    # 2. Defensive Data Directory Resolution (handles both root curriculum folder or pretrain subfolder)
+    data_path = Path(args.data_dir)
+    if (data_path / "pretrain").is_dir() and not list(data_path.glob("train_*.bin")) and not (data_path / "train.bin").exists():
+        args.data_dir = str(data_path / "pretrain")
+
+    # 3. Dynamic Scaling & Output Directory Resolution
     tok = get_tokenizer(args.tokenizer_type, args.tokenizer_path)
     runtime_cfg = RuntimeConfig.build(
         size=args.size,
@@ -248,7 +292,10 @@ def main():
     )
     model_cfg = runtime_cfg.model_cfg
     size_tag = runtime_cfg.size_tag
-    out_dir = args.output_dir or f"checkpoints/pretrain_{size_tag or get_model_tag()}"
+    
+    # Priority: Explicit CLI tag (e.g. 125M, 250M, 350M) > .env MODEL_TAG > dynamic size_tag
+    nominal_tag = args.size or os.getenv("MODEL_TAG") or size_tag or get_model_tag()
+    out_dir = args.output_dir or f"checkpoints/pretrain_{nominal_tag}"
     os.makedirs(out_dir, exist_ok=True)
 
     # Resolve architectural fields defensively across schema variants
@@ -259,14 +306,14 @@ def main():
     d_ffn = getattr(model_cfg, "d_ffn", getattr(model_cfg, "n_inner", "N/A"))
     max_seq_len = getattr(model_cfg, "max_seq_len", getattr(model_cfg, "block_size", 2048))
 
-    # 3. Micro-batch & Gradient Accumulation Geometry
+    # 4. Micro-batch & Gradient Accumulation Geometry
     B = int(args.micro_batch_size)
     T = int(max_seq_len)
     target_tokens_per_step = max(int(args.global_batch_size) * T, B * T * ddp_world_size)
     grad_accum_steps = max(1, target_tokens_per_step // (B * T * ddp_world_size))
     batch_tokens_per_step = B * T * grad_accum_steps * ddp_world_size
 
-    # 4. Data Loaders
+    # 5. Data Loaders
     train_loader = DistributedShardedDataLoader(
         data_dir=args.data_dir,
         split="train",
@@ -286,28 +333,65 @@ def main():
         device=device,
     )
 
-    total_tokens = train_loader.total_tokens()
-    max_steps = int(args.max_steps) if args.max_steps is not None else max(1, total_tokens // batch_tokens_per_step)
+    # 6. Fail-Fast Token & Step Budget Validation
+    available_tokens = train_loader.total_tokens()
+    target_tokens = parse_token_string(args.tokens)
 
-    # 5. Master Node Banner
+    if target_tokens is not None:
+        if target_tokens > available_tokens:
+            if master_process:
+                print("\n" + "=" * 70, file=sys.stderr)
+                print(f"[FATAL CONFIG ERROR] Insufficient tokens in '{args.data_dir}'!", file=sys.stderr)
+                print(f"  Requested Token Budget : {target_tokens:,} tokens ({target_tokens / 1e9:.2f}B)", file=sys.stderr)
+                print(f"  Available on Disk      : {available_tokens:,} tokens ({available_tokens / 1e9:.2f}B) across {len(train_loader.shards)} shards", file=sys.stderr)
+                print(f"  Deficit                : {target_tokens - available_tokens:,} tokens", file=sys.stderr)
+                print("=" * 70 + "\n", file=sys.stderr)
+            if ddp:
+                dist.destroy_process_group()
+            sys.exit(1)
+
+        total_budget_tokens = target_tokens
+        max_steps = math.ceil(total_budget_tokens / batch_tokens_per_step)
+    elif args.max_steps is not None:
+        max_steps = int(args.max_steps)
+        total_budget_tokens = max_steps * batch_tokens_per_step
+        if total_budget_tokens > available_tokens:
+            if master_process:
+                print("\n" + "=" * 70, file=sys.stderr)
+                print(f"[FATAL CONFIG ERROR] max_steps={max_steps} requires more tokens than available in '{args.data_dir}'!", file=sys.stderr)
+                print(f"  Required Token Budget  : {total_budget_tokens:,} tokens ({total_budget_tokens / 1e9:.2f}B)", file=sys.stderr)
+                print(f"  Available on Disk      : {available_tokens:,} tokens ({available_tokens / 1e9:.2f}B) across {len(train_loader.shards)} shards", file=sys.stderr)
+                print(f"  Deficit                : {total_budget_tokens - available_tokens:,} tokens", file=sys.stderr)
+                print("=" * 70 + "\n", file=sys.stderr)
+            if ddp:
+                dist.destroy_process_group()
+            sys.exit(1)
+    else:
+        total_budget_tokens = available_tokens
+        max_steps = max(1, total_budget_tokens // batch_tokens_per_step)
+
+    # 7. Master Node Banner
     if master_process:
         print("=" * 65)
         print("         slm-gpt Dynamic Distributed Pre-training Engine       ")
         print("=" * 65)
-        print(f"Target Size Tag:        {args.size} -> Resolved: {size_tag} ({runtime_cfg.actual_params:,} params)")
+        print(f"Target Size Tag:        {nominal_tag} (Checkpoint: {out_dir})")
+        print(f"Architecture Details:   Resolved: {size_tag} ({runtime_cfg.actual_params:,} params)")
         print(f"Data Directory:         {args.data_dir}")
-        print(f"Output Directory:       {out_dir}")
         print(f"Mode:                   {mode_str}")
         print(f"Cluster World Size:     {ddp_world_size} (Local Rank: {ddp_local_rank})")
         print(f"Device & Precision:     {device} | {'bfloat16' if dtype == torch.bfloat16 else 'float16'}")
         print(f"Sequence Length (T):    {T}")
         print(f"Micro-batch / GPU:      {B} | Global Batch Target: {args.global_batch_size}")
         print(f"Grad Accumulation:      {grad_accum_steps} micro-steps")
-        print(f"Learning Rate:          Peak: {args.learning_rate:.2e} -> Min: {args.min_learning_rate:.2e} (Warmup: {args.warmup_steps})")
+        print(f"Tokens / Step:          {batch_tokens_per_step:,}")
+        print(f"Token Budget Target:    {total_budget_tokens:,} ({total_budget_tokens/1e9:.2f}B) [Disk Pool: {available_tokens/1e9:.2f}B]")
+        print(f"Total Optimizer Steps:  {max_steps:,} (Warmup: {args.warmup_steps})")
+        print(f"Learning Rate:          Peak: {args.learning_rate:.2e} -> Min: {args.min_learning_rate:.2e}")
         print(f"Architecture:           Layers={n_layers}, d_model={d_model}, GQA={n_heads}:{n_kv_heads}, d_ffn={d_ffn}")
         print("-" * 65)
 
-    # 6. Model Initialization
+    # 8. Model Initialization
     torch.manual_seed(42 + ddp_rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42 + ddp_rank)
@@ -320,13 +404,8 @@ def main():
     raw_model = model.module if ddp else model
 
     total_params = sum(p.numel() for p in raw_model.parameters())
-    if master_process:
-        print(f"Verified Model Storage: {total_params:,} parameters ({total_params/1e6:.2f}M)")
-        print(f"Total Dataset Tokens:   {total_tokens:,} ({total_tokens/1e9:.2f}B)")
-        print(f"Batch Tokens / Step:    {batch_tokens_per_step:,} (Micro: {B}, Accum: {grad_accum_steps})")
-        print(f"Total Optimizer Steps:  {int(max_steps):,} (Warmup: {args.warmup_steps})")
 
-    # 7. Optimizer Setup
+    # 9. Optimizer Setup
     if hasattr(raw_model, "configure_optimizers"):
         optimizer = raw_model.configure_optimizers(
             weight_decay=args.weight_decay,
@@ -343,17 +422,19 @@ def main():
             device_type=device_type,
         )
 
-    # 8. W&B Logger Initialization
+    # 10. W&B Logger Initialization
     if master_process:
         wandb_key = os.getenv("WANDB_API_KEY")
         if wandb_key:
             wandb.login(key=wandb_key)
             wandb.init(
                 project=os.getenv("WANDB_PROJECT", "slm-gpt"),
-                name=f"{size_tag}-pretrain",
+                name=f"{nominal_tag}-pretrain",
                 config={
-                    "model_size": size_tag,
+                    "model_size": nominal_tag,
+                    "resolved_architecture_tag": size_tag,
                     "params": total_params,
+                    "target_tokens": total_budget_tokens,
                     "micro_batch_size": B,
                     "grad_accum_steps": grad_accum_steps,
                     "seq_len": T,
@@ -367,7 +448,7 @@ def main():
         else:
             print("[Logger] WANDB_API_KEY not found. Running with local console logging only.")
 
-    # 9. Initial Baseline Evaluation
+    # 11. Initial Baseline Evaluation
     val_loss = estimate_loss(model, val_loader, dtype=dtype, eval_iters=args.eval_iters)
     if master_process:
         print(f"Baseline Validation Loss: {val_loss:.4f}")
@@ -388,7 +469,7 @@ def main():
             init_ckpt_path,
         )
 
-    # 10. Core Pre-training Loop
+    # 12. Core Pre-training Loop
     best_val_loss = val_loss
     model.train()
     start_time = time.time()

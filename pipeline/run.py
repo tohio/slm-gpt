@@ -17,11 +17,12 @@ except ImportError:
 
 from dataclasses import dataclass
 import glob
+import math
 from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -34,14 +35,47 @@ from scaling.profiler import HardwareProfiler, tune_micro_batch_size
 from tokenizer.factory import get_tokenizer
 
 
+def parse_token_string(val: Optional[Union[str, int, float]]) -> Optional[int]:
+    """
+    Parses human-readable token strings like '5B', '14B', '500M', '500k', 
+    or raw integers into exact integer token counts.
+    """
+    if val is None or str(val).strip().lower() in ("none", ""):
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip().replace("_", "").upper()
+    multipliers = {
+        "K": 1_000,
+        "M": 1_000_000,
+        "B": 1_000_000_000,
+        "T": 1_000_000_000_000,
+    }
+    for suffix, mult in multipliers.items():
+        if s.endswith(suffix):
+            try:
+                return int(float(s[:-len(suffix)]) * mult)
+            except ValueError:
+                break
+    try:
+        return int(float(s))
+    except ValueError:
+        raise ValueError(f"Unable to parse token budget string: '{val}'")
+
+
 @dataclass
 class PipelineConfig:
     size: str = "125M"
+    stage: Optional[str] = None             # None (all), "pretrain", "sft", "dpo", "prepare"
+    tokens: Optional[str] = None            # e.g. "5B", "14B", "500M"
     tokenizer_type: str = "tiktoken"
     tokenizer_path: Optional[str] = None
     num_gpus: Optional[int] = None
     micro_batch_size: Optional[int] = None  # Explicit CLI override support
+    global_batch_size: Optional[int] = None
+    max_steps: Optional[int] = None         # CLI alias for pretrain_max_steps
     resume_from: Optional[str] = None       # None, "sft", or "dpo"
+    output_dir: Optional[str] = None
 
     # Stage Data Paths
     pretrain_data_dir: str = "data/pretrain"
@@ -64,9 +98,9 @@ class PipelineConfig:
 def parse_cli_args(args_cls: type[PipelineConfig]) -> PipelineConfig:
     kwargs: Dict[str, Any] = {}
     int_fields = {
-        "num_gpus", "micro_batch_size", "bootstrap_pretrain_tokens",
+        "num_gpus", "micro_batch_size", "global_batch_size", "bootstrap_pretrain_tokens",
         "bootstrap_sft_samples", "bootstrap_dpo_samples",
-        "pretrain_max_steps", "sft_epochs", "dpo_epochs", "dpo_max_steps"
+        "pretrain_max_steps", "max_steps", "sft_epochs", "dpo_epochs", "dpo_max_steps"
     }
     float_fields = {"dpo_learning_rate"}
 
@@ -91,7 +125,12 @@ class PipelineOrchestrator:
     def __init__(self, cfg: PipelineConfig):
         self.cfg = cfg
 
-        # 1. Profile Hardware & Auto-Generate Environment Requirements
+        # 1. Defensive Subdirectory Resolution for Pre-training Data
+        pretrain_path = Path(self.cfg.pretrain_data_dir)
+        if (pretrain_path / "pretrain").is_dir() and not list(pretrain_path.glob("train_*.bin")) and not (pretrain_path / "train.bin").exists():
+            self.cfg.pretrain_data_dir = str(pretrain_path / "pretrain")
+
+        # 2. Profile Hardware & Auto-Generate Environment Requirements
         print("=" * 70)
         print("  PROFILING LOCAL HARDWARE & ENVIRONMENT")
         print("=" * 70)
@@ -102,11 +141,11 @@ class PipelineOrchestrator:
         print(f"✓ Precision:       {self.hw_profile.precision_str}")
         print("=" * 70)
 
-        # 2. Resolve Available Compute
+        # 3. Resolve Available Compute
         detected_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
         self.num_gpus = cfg.num_gpus if cfg.num_gpus is not None else max(1, detected_gpus)
 
-        # 3. Derive Dynamic Runtime Parameters
+        # 4. Derive Dynamic Runtime Parameters
         tok = get_tokenizer(cfg.tokenizer_type, cfg.tokenizer_path)
         runtime_cfg = RuntimeConfig.build(
             size=cfg.size,
@@ -114,9 +153,10 @@ class PipelineOrchestrator:
             tokenizer_type=cfg.tokenizer_type,
             tokenizer_path=cfg.tokenizer_path,
         )
+        self.nominal_tag = cfg.size or runtime_cfg.size_tag
         self.size_tag = runtime_cfg.size_tag
 
-        # Honor manual CLI micro_batch_size if specified, otherwise auto-tune with vocab footprint
+        # Honor manual CLI micro_batch_size if specified, otherwise auto-tune
         if cfg.micro_batch_size is not None:
             self.auto_micro_batch = cfg.micro_batch_size
             print(f"[Config] Manual Micro-Batch Size per GPU specified: {self.auto_micro_batch}")
@@ -130,23 +170,32 @@ class PipelineOrchestrator:
             )
             print(f"[Auto-Tuner] Recommended Micro-Batch Size per GPU: {self.auto_micro_batch}")
 
+    def _resolve_checkpoint(self, stage: str) -> str:
+        """Finds checkpoints with priority for nominal_tag, falling back to dynamic size_tag."""
+        candidates = [
+            f"checkpoints/{stage}_{self.nominal_tag}/best_{'model' if stage == 'pretrain' else stage + '_model'}.pt",
+            f"checkpoints/{stage}_{self.nominal_tag}/latest.pt",
+            f"checkpoints/{stage}_{self.nominal_tag}/{'final_model' if stage == 'pretrain' else stage + '_final'}.pt",
+            f"checkpoints/{stage}_{self.size_tag}/best_{'model' if stage == 'pretrain' else stage + '_model'}.pt",
+            f"checkpoints/{stage}_{self.size_tag}/latest.pt",
+            f"checkpoints/{stage}_{self.size_tag}/{'final_model' if stage == 'pretrain' else stage + '_final'}.pt",
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return candidates[0]
+
     @property
     def pretrain_ckpt(self) -> str:
-        best = f"checkpoints/pretrain_{self.size_tag}/best_model.pt"
-        final = f"checkpoints/pretrain_{self.size_tag}/final_model.pt"
-        return best if os.path.exists(best) else final
+        return self._resolve_checkpoint("pretrain")
 
     @property
     def sft_ckpt(self) -> str:
-        best = f"checkpoints/sft_{self.size_tag}/best_sft_model.pt"
-        final = f"checkpoints/sft_{self.size_tag}/sft_final.pt"
-        return best if os.path.exists(best) else final
+        return self._resolve_checkpoint("sft")
 
     @property
     def dpo_ckpt(self) -> str:
-        best = f"checkpoints/dpo_{self.size_tag}/best_dpo_model.pt"
-        final = f"checkpoints/dpo_{self.size_tag}/dpo_final.pt"
-        return best if os.path.exists(best) else final
+        return self._resolve_checkpoint("dpo")
 
     def print_stage_banner(self, name: str):
         print("\n" + "=" * 70)
@@ -175,15 +224,21 @@ class PipelineOrchestrator:
         """Stage 0: Autonomous Cold-Start Data Ingestion & Packing Gate."""
         self.print_stage_banner("0. Autonomous Data Ingestion & Verification")
 
-        # 0A. Pre-training Shard Check
-        has_train = bool(
-            os.path.exists(os.path.join(self.cfg.pretrain_data_dir, "train.bin"))
-            or glob.glob(os.path.join(self.cfg.pretrain_data_dir, "train_*.bin"))
-        )
-        has_val = bool(
-            os.path.exists(os.path.join(self.cfg.pretrain_data_dir, "val.bin"))
-            or glob.glob(os.path.join(self.cfg.pretrain_data_dir, "val_*.bin"))
-        )
+        # 0A. Pre-training Shard Check & Validation Shard Resilience
+        train_shards = sorted(glob.glob(os.path.join(self.cfg.pretrain_data_dir, "train_*.bin")))
+        has_train = bool(os.path.exists(os.path.join(self.cfg.pretrain_data_dir, "train.bin")) or train_shards)
+        val_shards = sorted(glob.glob(os.path.join(self.cfg.pretrain_data_dir, "val_*.bin")))
+        has_val = bool(os.path.exists(os.path.join(self.cfg.pretrain_data_dir, "val.bin")) or val_shards)
+
+        # Auto-link last train shard if val shard is missing
+        if has_train and not has_val and train_shards:
+            target_val = os.path.join(self.cfg.pretrain_data_dir, "val_00000.bin")
+            try:
+                os.symlink(os.path.abspath(train_shards[-1]), target_val)
+                print(f"✓ Linked validation shard: '{os.path.basename(train_shards[-1])}' -> '{target_val}'")
+                has_val = True
+            except Exception as e:
+                print(f"⚠️ Failed to symlink val shard ({e}).")
 
         if not (has_train and has_val) and self.cfg.resume_from not in ("sft", "dpo"):
             print(f"⚠️ Pre-training binary shards missing in '{self.cfg.pretrain_data_dir}'.")
@@ -202,7 +257,7 @@ class PipelineOrchestrator:
         else:
             print(f"✓ Pre-training shards verified in '{self.cfg.pretrain_data_dir}'")
 
-        # 0B. SFT Dialogue Check (Composite Local Ingestion)
+        # 0B. SFT Dialogue Check
         if not os.path.exists(self.cfg.sft_data_path) and self.cfg.resume_from != "dpo":
             print(f"⚠️ SFT dataset missing at '{self.cfg.sft_data_path}'. Executing composite harvest...")
             out_dir = os.path.dirname(self.cfg.sft_data_path) or "data/sft"
@@ -218,11 +273,10 @@ class PipelineOrchestrator:
         else:
             print(f"✓ SFT dataset verified at '{self.cfg.sft_data_path}'")
 
-        # 0C. DPO Preference Check (Composite Local Ingestion)
+        # 0C. DPO Preference Check
         dpo_missing = not os.path.exists(self.cfg.dpo_data_path)
         dpo_stub = False
         if not dpo_missing:
-            # Stub check: less than 50KB means mock or tiny bootstrap stub
             size_bytes = os.path.getsize(self.cfg.dpo_data_path)
             if size_bytes < 50_000:
                 dpo_stub = True
@@ -256,19 +310,48 @@ class PipelineOrchestrator:
             print(f"⏩ Skipping Pre-training (resuming from stage '{self.cfg.resume_from}').")
             return
 
+        # Pre-flight fail-fast token budget validation before spawning torchrun
+        target_tokens = parse_token_string(self.cfg.tokens)
+        effective_max_steps = self.cfg.max_steps or self.cfg.pretrain_max_steps
+
+        shards = sorted(glob.glob(os.path.join(self.cfg.pretrain_data_dir, "train_*.bin")))
+        if not shards and os.path.exists(os.path.join(self.cfg.pretrain_data_dir, "train.bin")):
+            shards = [os.path.join(self.cfg.pretrain_data_dir, "train.bin")]
+
+        if shards:
+            available_tokens = sum(os.path.getsize(s) // 2 for s in shards)
+            if target_tokens is not None and target_tokens > available_tokens:
+                print("\n" + "=" * 70, file=sys.stderr)
+                print(f"[FATAL CONFIG ERROR] Insufficient tokens in '{self.cfg.pretrain_data_dir}'!", file=sys.stderr)
+                print(f"  Requested Token Budget : {target_tokens:,} tokens ({target_tokens / 1e9:.2f}B)", file=sys.stderr)
+                print(f"  Available on Disk      : {available_tokens:,} tokens ({available_tokens / 1e9:.2f}B) across {len(shards)} shards", file=sys.stderr)
+                print(f"  Deficit                : {target_tokens - available_tokens:,} tokens", file=sys.stderr)
+                print("=" * 70 + "\n", file=sys.stderr)
+                raise RuntimeError(
+                    f"Pre-training aborted: requested {target_tokens/1e9:.2f}B tokens, "
+                    f"but only {available_tokens/1e9:.2f}B exist on disk."
+                )
+
+        output_dir = self.cfg.output_dir or f"checkpoints/pretrain_{self.nominal_tag}"
+
         cmd = [
             "torchrun",
             f"--nproc_per_node={self.num_gpus}",
             "-m", "pretrain.train",
-            f"size={self.cfg.size}",
+            f"size={self.nominal_tag}",
             f"data_dir={self.cfg.pretrain_data_dir}",
+            f"output_dir={output_dir}",
             f"tokenizer_type={self.cfg.tokenizer_type}",
             f"micro_batch_size={self.auto_micro_batch}",
         ]
+        if self.cfg.global_batch_size:
+            cmd.append(f"global_batch_size={self.cfg.global_batch_size}")
+        if self.cfg.tokens:
+            cmd.append(f"tokens={self.cfg.tokens}")
+        if effective_max_steps:
+            cmd.append(f"max_steps={effective_max_steps}")
         if self.cfg.tokenizer_path:
             cmd.append(f"tokenizer_path={self.cfg.tokenizer_path}")
-        if self.cfg.pretrain_max_steps:
-            cmd.append(f"max_steps={self.cfg.pretrain_max_steps}")
 
         print(f"Command: {' '.join(cmd)}")
         ret = subprocess.run(cmd)
@@ -293,7 +376,7 @@ class PipelineOrchestrator:
             sys.executable,
             "-m", "sft.train",
             f"pretrained_ckpt={self.pretrain_ckpt}",
-            f"output_dir=checkpoints/sft_{self.size_tag}",
+            f"output_dir=checkpoints/sft_{self.nominal_tag}",
             f"data_path={self.cfg.sft_data_path}",
             f"epochs={self.cfg.sft_epochs}",
             f"tokenizer_type={self.cfg.tokenizer_type}",
@@ -322,7 +405,7 @@ class PipelineOrchestrator:
             sys.executable,
             "-m", "dpo.train",
             f"sft_model_path={self.sft_ckpt}",
-            f"output_dir=checkpoints/dpo_{self.size_tag}",
+            f"output_dir=checkpoints/dpo_{self.nominal_tag}",
             f"data_path={self.cfg.dpo_data_path}",
             f"epochs={self.cfg.dpo_epochs}",
             f"learning_rate={self.cfg.dpo_learning_rate}",
@@ -348,24 +431,38 @@ class PipelineOrchestrator:
         print("=" * 70)
         print("       slm-gpt Autonomous Production Pipeline Orchestrator        ")
         print("=" * 70)
-        print(f"Model Size Target:      {self.cfg.size} (Tag: {self.size_tag})")
+        print(f"Model Size Target:      {self.nominal_tag} (Tag: {self.size_tag})")
         print(f"Hardware Profile:       {self.hw_profile.device_name} ({self.hw_profile.arch_generation})")
         print(f"Pre-training Compute:   {'Multi-GPU' if self.num_gpus > 1 else 'Single-GPU'} ({self.num_gpus} GPU{'s' if self.num_gpus > 1 else ''} via torchrun)")
         print(f"Alignment Compute:      Single-GPU (SFT & DPO)")
         print("=" * 70)
 
+        target_stage = (self.cfg.stage or "").lower()
+
+        if target_stage in ("prepare", "stage0", "data"):
+            self.ensure_data_prepared()
+            return
+
         # Stage 0: Data verification & bootstrap
         self.ensure_data_prepared()
 
-        # Stages 1-3: Core training pipeline
-        self.run_pretrain()
-        self.run_sft()
-        self.run_dpo()
+        # Handle stage selection or full sequence
+        if target_stage == "pretrain":
+            self.run_pretrain()
+        elif target_stage == "sft":
+            self.run_sft()
+        elif target_stage == "dpo":
+            self.run_dpo()
+        else:
+            self.run_pretrain()
+            self.run_sft()
+            self.run_dpo()
 
         elapsed_mins = (time.time() - start_time) / 60.0
         print("\n" + "=" * 70)
-        print(f"✓ Pipeline Run Successfully Completed in {elapsed_mins:.2f} minutes.")
-        print(f"Final Aligned Model: {self.dpo_ckpt}")
+        print(f"✓ Pipeline Execution Completed in {elapsed_mins:.2f} minutes.")
+        final_target = self.pretrain_ckpt if target_stage == "pretrain" else (self.sft_ckpt if target_stage == "sft" else self.dpo_ckpt)
+        print(f"Final Artifact: {final_target}")
         print("=" * 70)
 
 
