@@ -399,12 +399,11 @@ def eval_gsm8k(
 
 def _execute_code_isolated(code_body: str, test_cases: List[str], result_queue: multiprocessing.Queue):
     """Executes untrusted generated code with mocked IO in a child process."""
-    fake_env = {
-        "__builtins__": {
-            **__builtins__.__dict__ if hasattr(__builtins__, "__dict__") else __builtins__,
-            "input": lambda *args: "0",  # Guard against interactive stdin blocks
-        }
-    }
+    builtins_obj = __builtins__.__dict__ if hasattr(__builtins__, "__dict__") else __builtins__
+    builtins_dict = dict(builtins_obj)
+    builtins_dict["input"] = lambda *args: "0"  # Guard against interactive stdin blocks
+
+    fake_env = {"__builtins__": builtins_dict}
 
     # Silence all stdout/stderr from model code execution
     null_stream = io.StringIO()
@@ -543,17 +542,23 @@ def eval_dpo_margin(
         chosen = item.get("chosen", "")
         rejected = item.get("rejected", "")
 
-        prompt_tokens = tokenizer.encode(prompt)
+        # Format prompt with ChatML if raw text
+        if "<|im_start|>" not in prompt:
+            formatted_prompt = f"<|im_start|>user\n{prompt.strip()}<|im_end|>\n<|im_start|>assistant\n"
+        else:
+            formatted_prompt = prompt
+
+        prompt_tokens = tokenizer.encode(formatted_prompt)
         chosen_tokens = tokenizer.encode(chosen)
         rejected_tokens = tokenizer.encode(rejected)
 
-        sum_lp_chosen, _ = score_continuation_logprobs(model, prompt_tokens, chosen_tokens, device=device)
-        sum_lp_rejected, _ = score_continuation_logprobs(model, prompt_tokens, rejected_tokens, device=device)
+        _, avg_lp_chosen = score_continuation_logprobs(model, prompt_tokens, chosen_tokens, device=device)
+        _, avg_lp_rejected = score_continuation_logprobs(model, prompt_tokens, rejected_tokens, device=device)
 
-        margin = sum_lp_chosen - sum_lp_rejected
+        margin = avg_lp_chosen - avg_lp_rejected
         margins.append(margin)
 
-        if sum_lp_chosen > sum_lp_rejected:
+        if avg_lp_chosen > avg_lp_rejected:
             chosen_preferred += 1
 
     acc = (chosen_preferred / max(1, len(pairs))) * 100.0
